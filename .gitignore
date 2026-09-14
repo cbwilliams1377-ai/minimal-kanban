@@ -1,0 +1,18 @@
+# Build artifacts
+MinimalKanban.exe
+minimal_kanban-res.o
+*.exe
+*.o
+*.obj
+
+# Generated icon
+check-square.ico
+
+# BugBot runtime state (reports are the ticket queue; tracked in logs instead)
+reports/
+.bugbot/bugbot.log
+.bugbot/lock
+
+# Editor/OS cruft
+Thumbs.db
+Desktop.ini
