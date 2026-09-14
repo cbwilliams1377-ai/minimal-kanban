@@ -1,4 +1,5 @@
-$ErrorActionPreference = 'Stop'
+# 'Continue' so native command stderr (opencode) doesn't abort the script.
+$ErrorActionPreference = 'Continue'
 
 $scriptDir = $PSScriptRoot
 $configPath = Join-Path $scriptDir 'config.json'

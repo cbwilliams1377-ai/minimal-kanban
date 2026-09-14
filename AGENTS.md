@@ -35,7 +35,9 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 | `check-square.ico` | Application icon (generated from PNG) |
 | `check-square.png` | Source icon image |
 | `check-square.svg` | Vector source of the icon |
-| `MinimalKanban.exe` | Built executable |
+| `MinimalKanban.exe` | Built executable (git-ignored) |
+| `reports/` | BugBot report queue (`queue/`, `blocked/`, `done/`); git-ignored |
+| `.bugbot/` | BugBot config, driver contract, launcher + runner scripts (see below) |
 
 ## Source Map (`minimal_kanban.cpp`)
 
@@ -178,3 +180,26 @@ Hover-based keyboard actions use the card under the last known mouse position; t
 - **Shared action helpers** — stopwatch/blocked/edit/delete each have one implementation (mouse, keyboard, and menu all call the same helper) so behavior stays consistent.
 - **Timers keep running during save** — `SaveCards` writes the live total without stopping in-memory timers. On app close the total is persisted and restored as stopped.
 - **Extensible card properties** — the `Card` struct and `LoadCards`/`SaveCards` use defaults for missing fields, making it easy to add future properties.
+
+## BugBot (report automation)
+
+This repository also hosts a scheduled, agent-driven bug-fixing system. Reports are Markdown files in a
+folder-based queue; the **BugBot** agent driver (`.bugbot/BUGBOT.md`) governs how a headless `opencode run`
+processes them.
+
+- `reports/queue/` — pending reports, one file each, named `YYYYMMDD_HHMMSS-title.md` (oldest-first).
+  Status = location: nothing to parse.
+- `reports/blocked/` — awaiting the owner: either an **answered question** (agent appended
+  `## Questions for owner`, owner adds `## Owner response` and returns the file to `queue/`) or a
+  **review-mode fix** awaiting approval before the owner commits + moves it to `done/`.
+- `reports/done/` — completed reports, with the agent's `## Resolution` appended.
+- `.bugbot/config.json` — `workspace`, `mode` (`review`|`auto`), `model`, `opencodePath`.
+- `.bugbot/report.bat` + `report.ps1` — interactive capture launcher (writes a new report into `queue/`).
+- `.bugbot/run_bugbot.bat` + `run_bugbot.ps1` — the daily runner: locks, picks the oldest report,
+  invokes `opencode run --model <cfg> --auto` with `BUGBOT.md` as the prompt, appends a transcript to
+  `bugbot.log`.
+- `.bugbot/install_schedule.bat` — registers/removes the daily Windows scheduled task (from an elevated
+  prompt: `install_schedule.bat [time]` or `install_schedule.bat /delete`).
+
+If you're invoked to work a bug report that lives under `reports/`, follow `.bugbot/BUGBOT.md`'s rules
+exactly (build verification, one report per run, move/`## Resolution` bookkeeping, no guessing).
