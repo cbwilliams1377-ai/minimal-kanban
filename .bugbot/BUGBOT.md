@@ -19,8 +19,9 @@ reports per run, following this contract strictly.
 
 1. Read the report file fully.
 2. Implement the change in the source code, following the project's existing conventions.
-3. **Build verification is mandatory.** Run the project's build (see `AGENTS.md` / `build.bat`) and
-   confirm it completes with no errors. Do NOT finish any report without a clean build.
+3. **Build verification is mandatory.** Run the project's build and confirm it completes with no
+   errors — `build.bat` on Windows, `build.sh` (mingw-w64 cross-compile) on Linux/macOS. Do NOT finish
+   any report without a clean build.
 4. Decide the outcome:
 
 ### Outcome A — Needs more info

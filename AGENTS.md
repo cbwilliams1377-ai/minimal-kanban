@@ -14,7 +14,8 @@ A minimal, self-contained Kanban board for Windows. Single-file C++ application 
 
 ## Build
 
-Run `build.bat` from the workspace directory:
+Run `build.bat` from the workspace directory (Windows, MinGW), or `build.sh` on
+Linux/macOS (cross-compiles the Windows .exe with mingw-w64):
 
 ```bat
 ffmpeg -i check-square.png -vf scale=256:256 check-square.ico
@@ -31,7 +32,8 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 | `minimal_kanban.cpp` | Entire application source (single file) |
 | `minimal_kanban.rc` | Resource file — embeds `check-square.ico` as icon (ID 101) |
 | `minimal_kanban-res.o` | Compiled resource object (intermediate, from `windres`) |
-| `build.bat` | Build script |
+| `build.bat` | Build script (Windows) |
+| `build.sh` | Build script (Linux/macOS, cross-compiles with mingw-w64) |
 | `check-square.ico` | Application icon (generated from PNG) |
 | `check-square.png` | Source icon image |
 | `check-square.svg` | Vector source of the icon |
@@ -194,12 +196,15 @@ processes them.
   **review-mode fix** awaiting approval before the owner commits + moves it to `done/`.
 - `reports/done/` — completed reports, with the agent's `## Resolution` appended.
 - `.bugbot/config.json` — `workspace`, `mode` (`review`|`auto`), `model`, `opencodePath`.
-- `.bugbot/report.bat` + `report.ps1` — interactive capture launcher (writes a new report into `queue/`).
-- `.bugbot/run_bugbot.bat` + `run_bugbot.ps1` — the daily runner: locks, picks the oldest report,
+- `.bugbot/report.bat` + `report.ps1` — interactive capture launcher (Windows; writes a new report into `queue/`).
+- `.bugbot/report.sh` — interactive capture launcher (Linux/macOS).
+- `.bugbot/run_bugbot.bat` + `run_bugbot.ps1` — the daily runner (Windows): locks, picks the oldest report,
   invokes `opencode run --model <cfg> --auto` with `BUGBOT.md` as the prompt, appends a transcript to
   `bugbot.log`.
-- `.bugbot/install_schedule.bat` — registers/removes the daily Windows scheduled task (from an elevated
-  prompt: `install_schedule.bat [time]` or `install_schedule.bat /delete`).
+- `.bugbot/run_bugbot.sh` — the daily runner (Linux/macOS), same behavior.
+- `.bugbot/install_schedule.bat` — registers/removes the daily Windows scheduled task (elevated prompt:
+  `install_schedule.bat [time]` or `install_schedule.bat /delete`).
+- `.bugbot/install_schedule.sh` — daily cron entry (Linux/macOS, per-user crontab, no root needed).
 
 If you're invoked to work a bug report that lives under `reports/`, follow `.bugbot/BUGBOT.md`'s rules
 exactly (build verification, one report per run, move/`## Resolution` bookkeeping, no guessing).

@@ -11,6 +11,7 @@ check-square.ico
 # BugBot runtime state (reports are the ticket queue; tracked in logs instead)
 reports/
 .bugbot/bugbot.log
+.bugbot/cron.log
 .bugbot/lock
 
 # Editor/OS cruft
