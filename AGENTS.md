@@ -72,13 +72,14 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 - `JsonEscape(string)` — escapes `\`, `"`, `\n`, `\r`, `\t` for JSON strings.
 - `JsonUnescape(string)` — reverses the above.
-- `SaveCards()` — writes all cards to `board.json`. Writes `CardElapsedMs` per card (running timers included) and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves. `column`, `text`, `blocked`, `timer_ms` per card.
+- `SaveCards()` — writes all cards to `board.json`. Writes `TotalElapsedMs` per card (accumulated total, folding in any running session) and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves. `column`, `text`, `blocked`, `timer_ms` per card.
 - `LoadCards()` — line-by-line parser that reads the format produced by `SaveCards`. Expects one `{"column": N, "text": "...", "blocked": true/false, "timer_ms": N}` per line. `blocked` and `timer_ms` are optional (default false/0) for backward compatibility with older save files. Silently skips malformed lines.
 
 ### Timer Helpers (lines 74–139)
 
 - `NowMs()` — current time in milliseconds via QPC.
-- `CardElapsedMs(Card&)` — total elapsed ms (accumulated + active session if running).
+- `SessionElapsedMs(Card&)` — milliseconds of the current running session (0 when stopped).
+- `TotalElapsedMs(Card&)` — total elapsed ms (accumulated + active session if running); used for persistence and edit-timer pre-population.
 - `FormatTimer(ms)` — formats to `ss`, `m:ss`, or `h:mm:ss` depending on magnitude.
 - `StartLiveTimer(HWND)` / `StopLiveTimer(HWND)` — manage the 100ms `WM_TIMER` tick.
 - `StopAllTimers()` — finalizes all running card timers into `timerAccumulated`.
@@ -110,7 +111,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `TimeInputState` — tracks time dialog state.
 - `TimeInputProc()` — window procedure for the "Set timer" dialog (uses its own class, `TIME_CLASS`).
 - `ParseTimeString(wstring)` — parses `ss`, `m:ss`, or `h:mm:ss` into milliseconds; returns -1 on failure.
-- `AskForTime(HWND, int cardIndex)` — shows the manual time entry dialog, pre-populated with current elapsed time. On accept, sets the card's `timerAccumulated` (stopped).
+- `AskForTime(HWND, int cardIndex)` — shows the manual time entry dialog, pre-populated with current total time. On accept, sets the card's `timerAccumulated` (stopped).
 
 ### Main Window Procedure (lines ~560–790)
 
@@ -129,7 +130,7 @@ Handles all main board interactions:
 - **WM_PAINT** — double-buffered painting:
   - Background RGB(27,27,27), column backgrounds RGB(39,39,39), headers RGB(43,43,43).
   - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. Blocked takes drawing priority over green.
-  - Task text in top ~30px of card. Timer display right-justified in the bottom ~30px — green (RGB(50,180,50)) when running, gray (RGB(140,140,140)) when stopped.
+  - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live current-session** countup right-justified in green (RGB(50,180,50)) with a `+` prefix, shown only while running. Pausing or closing/saving appends the session to the total.
 - **WM_DESTROY** — stops live timer, saves (running timers' totals are persisted; they restore as stopped), frees fonts, posts quit.
 
 ### Entry Point (lines ~790–830)

@@ -87,10 +87,17 @@ static LONGLONG NowMs() {
     return t.QuadPart * 1000 / g_qpcFreq.QuadPart;
 }
 
-// Get the elapsed milliseconds for a card (running or stopped).
-static LONGLONG CardElapsedMs(const Card& c) {
-    if (c.timerStart != 0) return c.timerAccumulated + (NowMs() - c.timerStart);
-    return c.timerAccumulated;
+// Get the milliseconds of the current running session for a card (0 when stopped).
+static LONGLONG SessionElapsedMs(const Card& c) {
+    if (c.timerStart == 0) return 0;
+    return NowMs() - c.timerStart;
+}
+
+// Get the total elapsed milliseconds for a card, folding any in-flight session in.
+// Used when persisting so a running session is never lost ("session closed/saved
+// appends that time to the total").
+static LONGLONG TotalElapsedMs(const Card& c) {
+    return c.timerAccumulated + SessionElapsedMs(c);
 }
 
 // Format milliseconds into a display string: ss, m:ss, or h:mm:ss.
@@ -166,7 +173,7 @@ static std::string JsonUnescape(const std::string& s) {
 }
 
 // Write every card to the board.json file.
-// Running timers are NOT stopped here: CardElapsedMs includes the live session,
+// Running timers are NOT stopped here: TotalElapsedMs includes the live session,
 // so the saved value is always the current total. (On exit, WM_DESTROY calls
 // StopAllTimers first so the restored board always shows stopped timers.)
 static void SaveCards() {
@@ -178,7 +185,7 @@ static void SaveCards() {
         f << "    {\"column\": " << g_cards[i].column
           << ", \"text\": \"" << JsonEscape(Utf8(g_cards[i].text)) << "\""
           << ", \"blocked\": " << (g_cards[i].blocked ? "true" : "false")
-          << ", \"timer_ms\": " << CardElapsedMs(g_cards[i])
+          << ", \"timer_ms\": " << TotalElapsedMs(g_cards[i])
           << "}";
         if (i + 1 != g_cards.size()) f << ',';
         f << '\n';
@@ -504,8 +511,8 @@ static LONGLONG ParseTimeString(const std::wstring& s) {
 // Show the manual time entry dialog for a card.
 static void AskForTime(HWND hwnd, int cardIndex) {
     TimeInputState state;
-    // Pre-populate with current time if any.
-    LONGLONG ms = CardElapsedMs(g_cards[cardIndex]);
+    // Pre-populate with current total time if any.
+    LONGLONG ms = TotalElapsedMs(g_cards[cardIndex]);
     if (ms > 0) state.text = FormatTimer(ms);
     g_timeInput = &state;
     EnableWindow(hwnd, FALSE);
@@ -784,15 +791,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SelectObject(mem, g_font); SetTextColor(mem, RGB(225,225,225));
             RECT text = r; text.left += 12; text.right -= 12; text.bottom = text.top + 30;
             DrawTextW(mem, g_cards[index].text.c_str(), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-            // Timer display (right-justified, below task text).
-            LONGLONG elapsed = CardElapsedMs(g_cards[index]);
-            if (elapsed > 0 || g_cards[index].timerStart != 0) {
-                std::wstring timerText = FormatTimer(elapsed);
-                bool running = g_cards[index].timerStart != 0;
-                SetTextColor(mem, running ? RGB(50, 180, 50) : RGB(140, 140, 140));
-                SelectObject(mem, g_font);
-                RECT timerR = r; timerR.left += 12; timerR.right -= 12; timerR.top = r.top + 30; timerR.bottom = r.bottom;
-                DrawTextW(mem, timerText.c_str(), -1, &timerR, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            // Timer row (below task text): total time left-justified in gray,
+            // live current-session countup right-justified in green with a "+".
+            RECT lower = r; lower.left += 12; lower.right -= 12; lower.top = r.top + 30; lower.bottom = r.bottom;
+            if (g_cards[index].timerAccumulated > 0) {
+                SelectObject(mem, g_font); SetTextColor(mem, RGB(140, 140, 140));
+                DrawTextW(mem, FormatTimer(g_cards[index].timerAccumulated).c_str(), -1, &lower, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            }
+            if (g_cards[index].timerStart != 0) {
+                std::wstring sessionText = L"+" + FormatTimer(SessionElapsedMs(g_cards[index]));
+                SelectObject(mem, g_font); SetTextColor(mem, RGB(50, 180, 50));
+                DrawTextW(mem, sessionText.c_str(), -1, &lower, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             }
         }
         // Draw a copy of the dragged card under the mouse pointer.
