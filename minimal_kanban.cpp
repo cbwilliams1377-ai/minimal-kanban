@@ -16,7 +16,8 @@ struct Card {
     std::wstring text;
     int column;
     bool blocked = false;
-    LONGLONG timerAccumulated = 0; // milliseconds accumulated when stopped
+    LONGLONG timerAccumulated = 0; // completed time from runs before this program run
+    LONGLONG sessionAccumulated = 0; // this run's paused-session time; reset on app close
     LONGLONG timerStart = 0;       // QPC timestamp when running (0 = stopped)
 };
 
@@ -93,11 +94,12 @@ static LONGLONG SessionElapsedMs(const Card& c) {
     return NowMs() - c.timerStart;
 }
 
-// Get the total elapsed milliseconds for a card, folding any in-flight session in.
-// Used when persisting so a running session is never lost ("session closed/saved
-// appends that time to the total").
+// Get the total elapsed milliseconds for a card, folding the current run in.
+// The current run is sessionAccumulated (paused stretches) plus the in-flight
+// session when running. Used when persisting so time is never lost ("session
+// closed/saved appends that time to the persisted total").
 static LONGLONG TotalElapsedMs(const Card& c) {
-    return c.timerAccumulated + SessionElapsedMs(c);
+    return c.timerAccumulated + c.sessionAccumulated + SessionElapsedMs(c);
 }
 
 // Format milliseconds into a display string: ss, m:ss, or h:mm:ss.
@@ -127,12 +129,13 @@ static void StopLiveTimer(HWND hwnd) {
     if (g_liveTimerID != 0) { KillTimer(hwnd, TIMER_LIVE); g_liveTimerID = 0; }
 }
 
-// Stop all running card timers, finalizing their accumulated time.
+// Finalize all running card timers into their run counters. Kept for symmetry with
+// the pause path in ToggleTimer (currently unused; saves go through TotalElapsedMs).
 static void StopAllTimers() {
     LONGLONG now = NowMs();
     for (auto& c : g_cards) {
         if (c.timerStart != 0) {
-            c.timerAccumulated += (now - c.timerStart);
+            c.sessionAccumulated += (now - c.timerStart);
             c.timerStart = 0;
         }
     }
@@ -173,9 +176,10 @@ static std::string JsonUnescape(const std::string& s) {
 }
 
 // Write every card to the board.json file.
-// Running timers are NOT stopped here: TotalElapsedMs includes the live session,
-// so the saved value is always the current total. (On exit, WM_DESTROY calls
-// StopAllTimers first so the restored board always shows stopped timers.)
+// Timers are NOT stopped here: TotalElapsedMs includes the whole current run
+// (accumulated history + session pauses + any in-flight stretch), so the saved
+// value is always the current total. (WM_DESTROY saves; on reload the restored
+// board always shows stopped timers because sessionAccumulated is not persisted.)
 static void SaveCards() {
     // trunc clears the previous file before writing the current board.
     std::ofstream f(std::filesystem::path(DataPath()), std::ios::binary | std::ios::trunc);
@@ -533,16 +537,20 @@ static void AskForTime(HWND hwnd, int cardIndex) {
         if (parsed >= 0) {
             g_cards[cardIndex].timerAccumulated = parsed;
             g_cards[cardIndex].timerStart = 0; // stopped after manual entry
+            g_cards[cardIndex].sessionAccumulated = 0; // explicit set lets the run countup start fresh
             SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
         }
     }
     g_timeInput = nullptr;
 }
 
-// Toggle the stopwatch for a card: start when stopped, stop when running.
+// Toggle the stopwatch for a card: start when stopped, pause when running.
+// Pausing freezes the in-flight stretch into sessionAccumulated instead of the
+// accumulated total, so the live countup keeps displaying the value (it only
+// resets when the program closes and the card reloads).
 static void ToggleTimer(HWND hwnd, int index) {
     if (g_cards[index].timerStart != 0) {
-        g_cards[index].timerAccumulated += (NowMs() - g_cards[index].timerStart);
+        g_cards[index].sessionAccumulated += (NowMs() - g_cards[index].timerStart);
         g_cards[index].timerStart = 0;
         if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     } else {
@@ -792,14 +800,16 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT text = r; text.left += 12; text.right -= 12; text.bottom = text.top + 30;
             DrawTextW(mem, g_cards[index].text.c_str(), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             // Timer row (below task text): total time left-justified in gray,
-            // live current-session countup right-justified in green with a "+".
+            // live countup right-justified in green with a "+". The countup shows
+            // while running and stays frozen on the last value when paused; it only
+            // resets when the program closes (sessionAccumulated is not persisted).
             RECT lower = r; lower.left += 12; lower.right -= 12; lower.top = r.top + 30; lower.bottom = r.bottom;
             if (g_cards[index].timerAccumulated > 0) {
                 SelectObject(mem, g_font); SetTextColor(mem, RGB(140, 140, 140));
                 DrawTextW(mem, FormatTimer(g_cards[index].timerAccumulated).c_str(), -1, &lower, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             }
-            if (g_cards[index].timerStart != 0) {
-                std::wstring sessionText = L"+" + FormatTimer(SessionElapsedMs(g_cards[index]));
+            if (g_cards[index].sessionAccumulated > 0 || g_cards[index].timerStart != 0) {
+                std::wstring sessionText = L"+" + FormatTimer(g_cards[index].sessionAccumulated + SessionElapsedMs(g_cards[index]));
                 SelectObject(mem, g_font); SetTextColor(mem, RGB(50, 180, 50));
                 DrawTextW(mem, sessionText.c_str(), -1, &lower, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             }
