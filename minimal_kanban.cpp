@@ -4,7 +4,11 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h>
+#include <shellapi.h>
+#include <urlmon.h>
+#include <winternl.h>
 #include <algorithm>
+#include <iterator>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -31,6 +35,9 @@ static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main w
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
+static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
+static const wchar_t* GITHUB_REPO = L"minimal-kanban";
+static const wchar_t* APP_VERSION = L"0.1.0";
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
 
@@ -44,24 +51,27 @@ static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch up
 #define CMD_TOGGLE_TIMER 3
 #define CMD_EDIT_TIMER 4
 #define CMD_BLOCKED 5
+#define CMD_REPORT 6
+#define CMD_UPDATE 7
 
 // Owner-drawn menu item: the label plus the keyboard-hint shown right-aligned.
 struct MenuItemData { const wchar_t* text; const wchar_t* hint; };
 
-// Return the path where the board is saved.
-static std::wstring DataPath() {
+// Return the app's install directory under Local AppData, creating it if needed.
+static std::wstring AppLocalDir() {
     PWSTR raw = nullptr;
-    // Ask Windows for the user's Local AppData folder instead of hard-coding a username.
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &raw))) {
         std::wstring dir(raw);
-        CoTaskMemFree(raw); // SHGetKnownFolderPath allocated this string for us.
+        CoTaskMemFree(raw);
         dir += L"\\MinimalKanban";
-        CreateDirectoryW(dir.c_str(), nullptr); // Do nothing if the folder already exists.
-        return dir + L"\\board.json";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
     }
-    // Fallback used only if Windows cannot provide the AppData path.
-    return L"board.json";
+    return L".";
 }
+
+// Return the path where the board is saved.
+static std::wstring DataPath() { return AppLocalDir() + L"\\board.json"; }
 
 // Convert Windows' UTF-16 string type to UTF-8 for the JSON file.
 static std::string Utf8(const std::wstring& s) {
@@ -572,12 +582,152 @@ static int HoverIndex(const RECT& client, const POINT& p) {
     return -1;
 }
 
+// Percent-encode a string for use in a URL query string (UTF-8 aware).
+static std::string UrlEncode(const std::wstring& s) {
+    std::string u8 = Utf8(s);
+    std::string out;
+    static const char* hex = "0123456789ABCDEF";
+    for (unsigned char c : u8) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+            || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+        else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+    }
+    return out;
+}
+
+// Build the "Windows 10.0.22631" style string via RtlGetVersion (works on all Windows 10/11).
+static std::wstring OsVersion() {
+    std::wstring ver = L"unknown";
+    HMODULE ntdll = LoadLibraryW(L"ntdll.dll");
+    if (!ntdll) return ver;
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    auto rtl = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
+    if (rtl) {
+        RTL_OSVERSIONINFOW info{};
+        info.dwOSVersionInfoSize = sizeof(info);
+        if (rtl(&info) == 0)
+            ver = L"Windows " + std::to_wstring(info.dwMajorVersion) + L"." + std::to_wstring(info.dwMinorVersion)
+                + L"." + std::to_wstring(info.dwBuildNumber);
+    }
+    FreeLibrary(ntdll);
+    return ver;
+}
+
+static std::wstring GitHubRepoUrl(const wchar_t* suffix) {
+    return std::wstring(L"https://github.com/") + GITHUB_OWNER + L"/" + GITHUB_REPO + suffix;
+}
+
+static std::wstring GitHubApiUrl(const wchar_t* suffix) {
+    return std::wstring(L"https://api.github.com/repos/") + GITHUB_OWNER + L"/" + GITHUB_REPO + suffix;
+}
+
+// Open the browser to a pre-filled "new issue" page on the project's repo.
+static void ReportBug(HWND hwnd) {
+    std::wstring title = L"Bug report (MinimalKanban v" + std::wstring(APP_VERSION) + L")";
+    std::wstring body;
+    body += L"OS: " + OsVersion() + L"\n";
+    body += L"App version / build: v" + std::wstring(APP_VERSION) + L"\n";
+    body += L"Board file: " + DataPath() + L"\n\n";
+    body += L"## What happened\n\n\n";
+    body += L"## Steps to reproduce\n\n1. \n\n";
+    body += L"## Expected behavior\n\n\n";
+    body += L"## Notes\n\n";
+    std::wstring url = GitHubRepoUrl(L"/issues/new?title=") + Wide(UrlEncode(title)) + L"&body=" + Wide(UrlEncode(body));
+    ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Extract tag_name from a GitHub releases/latest JSON payload.
+static std::wstring ReadTagName(const std::string& json) {
+    const std::string key = "\"tag_name\"";
+    size_t p = json.find(key);
+    if (p == std::string::npos) return {};
+    size_t q1 = json.find('"', p + key.size());
+    if (q1 == std::string::npos) return {};
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return {};
+    return Wide(json.substr(q1 + 1, q2 - q1 - 1));
+}
+
+// Compare dotted numeric versions. Returns <0 (a older), 0 (equal), >0 (a newer).
+static int VersionCmp(const std::wstring& a, const std::wstring& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        size_t e1 = a.find(L'.', i), e2 = b.find(L'.', j);
+        if (e1 == std::wstring::npos) e1 = a.size();
+        if (e2 == std::wstring::npos) e2 = b.size();
+        long long v1 = 0, v2 = 0;
+        try { if (i < a.size()) v1 = std::stoll(a.substr(i, e1 - i)); } catch (...) {}
+        try { if (j < b.size()) v2 = std::stoll(b.substr(j, e2 - j)); } catch (...) {}
+        if (v1 != v2) return v1 < v2 ? -1 : 1;
+        i = e1 + 1; j = e2 + 1;
+    }
+    return 0;
+}
+
+// Swap in the freshly downloaded exe after this process exits, then relaunch from LocalAppData.
+static void InstallUpdate(HWND hwnd, const std::wstring& newPath) {
+    std::wstring dest = AppLocalDir() + L"\\MinimalKanban.exe";
+    std::wstring cmd = L"cmd.exe /c ping -n 4 127.0.0.1 >nul & move /y \""
+        + newPath + L"\" \"" + dest + L"\" & start \"\" \"" + dest + L"\"";
+    STARTUPINFOW si{ sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        MessageBoxW(hwnd, L"Update downloaded. The app will restart automatically in a few seconds.",
+            L"Check for Updates", MB_OK | MB_ICONINFORMATION);
+        PostQuitMessage(0);
+    } else {
+        MessageBoxW(hwnd, L"The update downloaded, but it could not be installed.",
+            L"Check for Updates", MB_OK | MB_ICONWARNING);
+    }
+}
+
+// Check the latest GitHub release, download it if newer, install and restart.
+static void UpdateCheck(HWND hwnd) {
+    if (wcscmp(GITHUB_OWNER, L"your-github-username") == 0) {
+        MessageBoxW(hwnd, L"Set the GitHub owner for this build in minimal_kanban.cpp, then rebuild.",
+            L"Check for Updates", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    std::wstring dir = AppLocalDir();
+    std::wstring infoPath = dir + L"\\update_info.json";
+    std::wstring newPath = dir + L"\\MinimalKanban.new.exe";
+    if (FAILED(URLDownloadToFileW(nullptr, GitHubApiUrl(L"/releases/latest").c_str(), infoPath.c_str(), 0, nullptr))) {
+        MessageBoxW(hwnd, L"Could not reach GitHub to check for updates.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    std::ifstream f(std::filesystem::path(infoPath), std::ios::binary);
+    if (!f) { MessageBoxW(hwnd, L"Could not read the release info.", L"Check for Updates", MB_OK | MB_ICONWARNING); return; }
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::wstring tag = ReadTagName(json);
+    if (tag.empty()) { MessageBoxW(hwnd, L"Could not read the release info.", L"Check for Updates", MB_OK | MB_ICONWARNING); return; }
+    std::wstring latest = tag;
+    if (!latest.empty() && (latest[0] == L'v' || latest[0] == L'V')) latest = latest.substr(1);
+    if (VersionCmp(latest, APP_VERSION) <= 0) {
+        MessageBoxW(hwnd, (L"You're up to date (v" + std::wstring(APP_VERSION) + L").").c_str(),
+            L"Check for Updates", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    int res = MessageBoxW(hwnd,
+        (L"A new version (" + tag + L") is available.\n\nDownload and install it now?").c_str(),
+        L"Check for Updates", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
+    if (res != IDYES) return;
+    if (FAILED(URLDownloadToFileW(nullptr, GitHubRepoUrl(L"/releases/latest/download/MinimalKanban.exe").c_str(), newPath.c_str(), 0, nullptr))) {
+        MessageBoxW(hwnd, L"The update failed to download.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    InstallUpdate(hwnd, newPath);
+}
+
 // Window procedure for the main board window.
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_KEYDOWN:
         // Ctrl+N is a keyboard shortcut for adding a card.
         if (wp == 'N' && (GetKeyState(VK_CONTROL) & 0x8000)) { AddCard(hwnd); return 0; }
+        if (wp == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) { ReportBug(hwnd); return 0; }
+        if (wp == 'U' && (GetKeyState(VK_CONTROL) & 0x8000)) { UpdateCheck(hwnd); return 0; }
         // Hover-based keyboard actions operate on the card under the last mouse position.
         if (wp == VK_SPACE || wp == VK_DELETE || wp == 'D' || wp == 'S' || wp == 'T' || wp == 'B') {
             RECT client{}; GetClientRect(hwnd, &client);
@@ -650,7 +800,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_lastMouse = p;
         RECT client{}; GetClientRect(hwnd, &client);
         int target = HoverIndex(client, p);
-        if (target < 0) return 0;
+        if (target < 0) {
+            // Global menu when the click is on empty board space.
+            POINT screen = p; ClientToScreen(hwnd, &screen);
+            MenuItemData globalItems[] = {
+                { L"Report a Bug",     L"(ctrl+r)" },
+                { L"Check for Updates", L"(ctrl+u)" },
+            };
+            const int globalCmds[] = { CMD_REPORT, CMD_UPDATE };
+            HMENU menu = CreatePopupMenu();
+            for (int i = 0; i < 2; ++i)
+                AppendMenuW(menu, MF_OWNERDRAW, globalCmds[i], (LPCTSTR)&globalItems[i]);
+            int cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, hwnd, nullptr);
+            DestroyMenu(menu);
+            if (cmd == CMD_REPORT) ReportBug(hwnd);
+            else if (cmd == CMD_UPDATE) UpdateCheck(hwnd);
+            return 0;
+        }
         POINT screen = p; ClientToScreen(hwnd, &screen);
         // Owner-drawn entries so the menu matches the dark theme.
         MenuItemData items[] = {

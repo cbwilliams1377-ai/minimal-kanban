@@ -9,7 +9,7 @@ A minimal, self-contained Kanban board for Windows. Single-file C++ application 
 - **Language**: C++17
 - **UI**: Raw Win32 API (GDI painting, window messages)
 - **Compiler**: MinGW g++ (invoked via `build.bat`)
-- **Dependencies**: None beyond Windows system libraries (`gdi32`, `user32`, `shell32`, `ole32`, `uuid`)
+- **Dependencies**: None beyond Windows system libraries (`gdi32`, `user32`, `shell32`, `ole32`, `uuid`, `urlmon`)
 - **Data format**: Hand-rolled JSON (no JSON library)
 
 ## Build
@@ -20,7 +20,7 @@ Linux/macOS (cross-compiles the Windows .exe with mingw-w64):
 ```bat
 ffmpeg -i check-square.png -vf scale=256:256 check-square.ico
 windres minimal_kanban.rc minimal_kanban-res.o
-g++ minimal_kanban.cpp minimal_kanban-res.o -o MinimalKanban.exe -std=c++17 -O2 -s -mwindows -static -static-libgcc -static-libstdc++ -municode -lole32 -lshell32 -lgdi32 -luser32 -luuid
+g++ minimal_kanban.cpp minimal_kanban-res.o -o MinimalKanban.exe -std=c++17 -O2 -s -mwindows -static -static-libgcc -static-libstdc++ -municode -lurlmon -lole32 -lshell32 -lgdi32 -luser32 -luuid
 ```
 
 Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
@@ -40,6 +40,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 | `MinimalKanban.exe` | Built executable (git-ignored) |
 | `reports/` | BugBot report queue (`queue/`, `blocked/`, `done/`); git-ignored |
 | `.bugbot/` | BugBot config, driver contract, launcher + runner scripts (see below) |
+| `server/` | BugBot Docker container: `Dockerfile`, `entrypoint.sh`, `run-daily.sh`, `sync_issues.sh`, compose + env template |
 
 ## Source Map (`minimal_kanban.cpp`)
 
@@ -137,6 +138,18 @@ Handles all main board interactions:
 
 - `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input), loads cards, creates main window (920×520), enables dark title bar, runs message loop.
 
+### Networking & Self-Updates (GitHub integration)
+
+All network use is on-demand — there are no threads, timers, or persistent connections hanging around.
+`GITHUB_OWNER`, `GITHUB_REPO`, and `APP_VERSION` are compile-time constants near the top of the file.
+
+- `UrlEncode(wstring)` — UTF-8-aware percent-encoding for URL query strings.
+- `OsVersion()` — real Windows version via dynamically-loaded `RtlGetVersion` (works on Win10/11).
+- `ReportBug(HWND)` — `ShellExecuteW` opens a pre-filled GitHub **new issue** URL (title/body come from a compact pure-`WideCharToMultiByte` encoder; user's browser does GitHub auth).
+- `UpdateCheck(HWND)` — hits `api.github.com/.../releases/latest` via `URLDownloadToFileW` (writes to disk, not RAM), compares `tag_name` to the compiled `APP_VERSION` with `VersionCmp` (dotted-numeric), prompts, then downloads the release asset in place.
+- `InstallUpdate(HWND, path)` — spawns a detached, hidden `cmd` that waits ~3s for the process to exit, `move`s the new exe over the running one in `%LOCALAPPDATA%`, and relaunches.
+- Entry points: **right-click empty board space** shows a global owner-drawn menu (**Report a Bug** / **Check for Updates**); **Ctrl+R** and **Ctrl+U** do the same. `CMD_REPORT`/`CMD_UPDATE` are the menu IDs; the global menu reuses the card menu's `WM_MEASUREITEM`/`WM_DRAWITEM` painting.
+
 ## Data Format
 
 `%LOCALAPPDATA%\MinimalKanban\board.json`:
@@ -167,6 +180,8 @@ Handles all main board interactions:
 | Delete card | Right-click → Delete | **Delete** or **D** |
 | Set stopwatch time manually | Right-click → Edit Timer | **T** |
 | Add new card | Click "+ Add a card" | **Ctrl+N** |
+| File a bug report (opens browser) | Right-click empty space → Report a Bug | **Ctrl+R** |
+| Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 
 Hover-based keyboard actions use the card under the last known mouse position; they no-op if the cursor isn't over a card.
 
@@ -174,7 +189,7 @@ Hover-based keyboard actions use the card under the last known mouse position; t
 
 - **Single file** — all code lives in `minimal_kanban.cpp`. No header files, no separate modules.
 - **Global state** — prefixed with `g_` (e.g., `g_cards`, `g_font`).
-- **No external libraries** — pure Win32 API only. Dynamically load optional DLLs (`dwmapi.dll`, `uxtheme.dll`) with manual `GetProcAddress` for backward compatibility.
+- **No external libraries** — pure Win32 API only (plus Windows system DLLs `urlmon` for the update check; this is a Microsoft OS library, not a third-party dependency). Dynamically load optional DLLs (`dwmapi.dll`, `uxtheme.dll`, `ntdll.dll`) with manual `GetProcAddress` for backward compatibility.
 - **UTF-16 internally, UTF-8 for files** — all UI strings are `std::wstring`. JSON files are UTF-8.
 - **Dark theme** — hardcoded RGB values, no theming system. Popup menus are owner-drawn to match.
 - **Double-buffered painting** — all rendering goes to an off-screen bitmap first to avoid flicker.
@@ -190,22 +205,38 @@ This repository also hosts a scheduled, agent-driven bug-fixing system. Reports 
 folder-based queue; the **BugBot** agent driver (`.bugbot/BUGBOT.md`) governs how a headless `opencode run`
 processes them.
 
+The bug pipeline (GitHub-integrated):
+
+1. A bug is reported as a **GitHub issue** (in-app "Report a Bug" opens a pre-filled issue; web/phone work too).
+2. The **BugBot server container** (`server/` — Docker Compose, cron) runs daily:
+   - `entrypoint.sh` checks out/clones the repo into a named volume (`/workspace`).
+   - `sync_issues.sh` turns open GitHub issues into `reports/queue/*.md`, and re-queues
+     `blocked/` reports whose issue has new owner comments (appended as `## Owner response`).
+   - `run-daily.sh` invokes `run_bugbot.sh` (the agent, auto mode), then, when the agent changed source:
+     bumps `APP_VERSION`, cross-compiles `build.sh`, pushes, publishes a `vX.Y.Z` GitHub **release** with
+     the built `MinimalKanban.exe`, and closes the issues whose reports landed in `done/`.
+   - The in-app **Check for Updates** downloads the newest release asset and self-installs to `%LOCALAPPDATA%`.
+3. `report.bat`/`report.ps1`/`report.sh` remain as local-only capture launchers (no GitHub dependency).
+
+`reports/` layout:
+
 - `reports/queue/` — pending reports, one file each, named `YYYYMMDD_HHMMSS-title.md` (oldest-first).
   Status = location: nothing to parse.
 - `reports/blocked/` — awaiting the owner: either an **answered question** (agent appended
   `## Questions for owner`, owner adds `## Owner response` and returns the file to `queue/`) or a
   **review-mode fix** awaiting approval before the owner commits + moves it to `done/`.
 - `reports/done/` — completed reports, with the agent's `## Resolution` appended.
-- `.bugbot/config.json` — `workspace`, `mode` (`review`|`auto`), `model`, `opencodePath`.
-- `.bugbot/report.bat` + `report.ps1` — interactive capture launcher (Windows; writes a new report into `queue/`).
-- `.bugbot/report.sh` — interactive capture launcher (Linux/macOS).
-- `.bugbot/run_bugbot.bat` + `run_bugbot.ps1` — the daily runner (Windows): locks, picks the oldest report,
-  invokes `opencode run --model <cfg> --auto` with `BUGBOT.md` as the prompt, appends a transcript to
-  `bugbot.log`.
-- `.bugbot/run_bugbot.sh` — the daily runner (Linux/macOS), same behavior.
-- `.bugbot/install_schedule.bat` — registers/removes the daily Windows scheduled task (elevated prompt:
-  `install_schedule.bat [time]` or `install_schedule.bat /delete`).
-- `.bugbot/install_schedule.sh` — daily cron entry (Linux/macOS, per-user crontab, no root needed).
+- Automatic reports carry `- #<issue>` in the filename so `server/sync_issues.sh` can match an
+  issue to its report and dedupe / close issues; local reports just use a description slug.
+
+Server-side files:
+
+- `server/Dockerfile` — Debian image with mingw-w64 cross toolchain, ffmpeg, `gh`, and opencode.
+- `server/entrypoint.sh` — clone/pull on start, `gh auth`, cron schedule, optional start-run.
+- `server/run-daily.sh` — pull → sync issues → run agent → bump version → build → push → release → close.
+- `server/sync_issues.sh` — GitHub issues ↔ `reports/` bridge (dedupe + owner-response resume).
+- `server/docker-compose.yml` + `server/.env.example` — copy `.env.example` to `.env` and fill in
+  `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_TOKEN` (fine-grained PAT: Contents R/W, Issues R/W, Releases R/W).
 
 If you're invoked to work a bug report that lives under `reports/`, follow `.bugbot/BUGBOT.md`'s rules
 exactly (build verification, one report per run, move/`## Resolution` bookkeeping, no guessing).

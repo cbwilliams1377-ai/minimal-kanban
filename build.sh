@@ -22,5 +22,5 @@ done
 
 ffmpeg -y -hide_banner -loglevel error -i check-square.png -vf scale=256:256 check-square.ico
 "$RC" minimal_kanban.rc minimal_kanban-res.o
-"$CC" minimal_kanban.cpp minimal_kanban-res.o -o MinimalKanban.exe -std=c++17 -O2 -s -mwindows -static -static-libgcc -static-libstdc++ -municode -lole32 -lshell32 -lgdi32 -luser32 -luuid
+"$CC" minimal_kanban.cpp minimal_kanban-res.o -o MinimalKanban.exe -std=c++17 -O2 -s -mwindows -static -static-libgcc -static-libstdc++ -municode -lurlmon -lole32 -lshell32 -lgdi32 -luser32 -luuid
 echo "Built cross-compiled MinimalKanban.exe (Windows binary)."

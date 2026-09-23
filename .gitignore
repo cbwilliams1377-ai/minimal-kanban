@@ -17,3 +17,6 @@ reports/
 # Editor/OS cruft
 Thumbs.db
 Desktop.ini
+
+# Server secrets
+server/.env

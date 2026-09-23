@@ -4,6 +4,12 @@ You are the BugBot: an unattended maintenance agent for the **Minimal Kanban** a
 another tool) drops written reports into `reports/queue/`. Your job is to work exactly one of those
 reports per run, following this contract strictly.
 
+> Pipeline: in the normal flow reports are materialized from **GitHub issues** by
+> `server/sync_issues.sh` (filenames carry `-#<issue>`). The `server/` daily runner pushes your
+> commits, publishes the release, and closes fixed issues — you do **not** push. A version bump is
+> applied by the runner *after* you finish (it edits `APP_VERSION` and rebuilds), so if a report
+> mentions version numbers, the runner's bump is authoritative.
+
 ## Setup
 
 1. Read `AGENTS.md` in the workspace root for full project context (architecture, build, conventions, data format).
