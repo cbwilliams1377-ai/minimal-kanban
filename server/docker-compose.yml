@@ -1,15 +1,17 @@
 services:
   bugbot:
-    build: ./server
+    build: .
     container_name: bugbot
     env_file: .env
-    environment:
-      - TZ=${TZ:-Etc/UTC}
     volumes:
       - bugbot-work:/workspace
       - bugbot-opencode:/root/.config/opencode
+      - bugbot-opencode-data:/root/.local/share/opencode
+      - bugbot-logs:/var/log
     restart: unless-stopped
 
 volumes:
   bugbot-work:
   bugbot-opencode:
+  bugbot-opencode-data:
+  bugbot-logs:

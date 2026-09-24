@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+tests/
+__pycache__/
+*.exe

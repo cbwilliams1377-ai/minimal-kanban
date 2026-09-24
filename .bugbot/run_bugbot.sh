@@ -45,10 +45,12 @@ OC="$(cfg_get opencodePath)"
 [ -n "$OC" ] || OC=opencode
 
 # Lock to prevent overlapping runs (same "lock" file convention as the Windows runner).
-exec 9>"$LOCK"
-if ! flock -n 9; then
-    write_log "SKIP: another BugBot run is in progress. Exiting."
-    exit 0
+if [[ "${BUGBOT_LOCK_HELD:-0}" != 1 ]]; then
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        write_log "SKIP: another BugBot run is in progress. Exiting."
+        exit 0
+    fi
 fi
 
 # Pick the oldest pending report (bash globs expand in sorted order).
@@ -69,4 +71,7 @@ write_log "Running: $OC run --dir <workspace> --model $MODEL --auto (prompt = BU
 
 prompt="$(cat "$PROMPT_FILE")"
 "$OC" run --dir "$WORKSPACE" --model "$MODEL" --auto "$prompt" 2>&1 | tee -a "$LOG"
-write_log "Exit code: ${PIPESTATUS[0]}"
+statuses=("${PIPESTATUS[@]}")
+write_log "Exit code: ${statuses[0]}"
+(( statuses[0] == 0 )) || exit "${statuses[0]}"
+exit "${statuses[1]}"

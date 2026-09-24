@@ -213,8 +213,10 @@ The bug pipeline (GitHub-integrated):
    - `sync_issues.sh` turns open GitHub issues into `reports/queue/*.md`, and re-queues
      `blocked/` reports whose issue has new owner comments (appended as `## Owner response`).
    - `run-daily.sh` invokes `run_bugbot.sh` (the agent, auto mode), then, when the agent changed source:
-     bumps `APP_VERSION`, cross-compiles `build.sh`, pushes, publishes a `vX.Y.Z` GitHub **release** with
-     the built `MinimalKanban.exe`, and closes the issues whose reports landed in `done/`.
+     bumps `APP_VERSION`, cross-compiles with `bash build.sh`, pushes the configured branch, uploads
+     `MinimalKanban.exe` to a draft release targeting the exact commit, publishes it, and closes only
+     the issue linked to that successfully published transaction. Failures retain persistent state
+     for retry; interrupted agents require inspection.
    - The in-app **Check for Updates** downloads the newest release asset and self-installs to `%LOCALAPPDATA%`.
 3. `report.bat`/`report.ps1`/`report.sh` remain as local-only capture launchers (no GitHub dependency).
 
@@ -236,7 +238,25 @@ Server-side files:
 - `server/run-daily.sh` — pull → sync issues → run agent → bump version → build → push → release → close.
 - `server/sync_issues.sh` — GitHub issues ↔ `reports/` bridge (dedupe + owner-response resume).
 - `server/docker-compose.yml` + `server/.env.example` — copy `.env.example` to `.env` and fill in
-  `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_TOKEN` (fine-grained PAT: Contents R/W, Issues R/W, Releases R/W).
+  `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_TOKEN` (fine-grained PAT: Contents R/W, Issues R/W).
 
 If you're invoked to work a bug report that lives under `reports/`, follow `.bugbot/BUGBOT.md`'s rules
 exactly (build verification, one report per run, move/`## Resolution` bookkeeping, no guessing).
+
+### Debian deployment and verification
+
+For a fresh Debian deployment, start with `server/OPENCODE-HANDOFF.md`.
+Follow `MinimalKanban-Bug-Pipeline-Setup.md` for the current server procedure.
+`GITHUB_BRANCH` defaults to `master` and is used explicitly for clone/pull/push.
+`RUN_ON_START=0` and `SCHEDULE_ENABLED=0` keep initial setup idle. Credentials use
+`GH_TOKEN`; OpenCode auth persists in `/root/.local/share/opencode`. Debian cron
+receives exported container variables through a root-only runtime file.
+
+The entire pipeline holds a lock. `.bugbot/server-state/pending.json` associates
+a report with its release commit/tag; a failed release retries before new work.
+Only fresh comments from `BUGBOT_OWNER` resume blocked reports; questions are
+posted back to GitHub. Issue deduplication uses exact filename issue numbers.
+
+Run `python3 server/tests/test_pipeline.py -v` for offline integration checks of
+success, failure/retry, report matching and owner replies. These use mocked APIs
+and temporary Git repositories, never real tickets or releases.

@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # System deps: git, gh CLI, ffmpeg, mingw-w64 cross toolchain, node (for opencode-ai)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git gnupg jq nodejs npm bash cron \
+        ca-certificates curl git gnupg jq nodejs npm bash cron tzdata util-linux \
         ffmpeg \
         g++-mingw-w64-x86-64 mingw-w64-x86-64-dev mingw-w64-tools \
     && rm -rf /var/lib/apt/lists/*

@@ -1,42 +1,59 @@
 #!/usr/bin/env bash
-# Container entrypoint: ensure the repo is checked out, then schedule the daily run.
 set -euo pipefail
-
 : "${GITHUB_OWNER:?GITHUB_OWNER is required}"
 : "${GITHUB_REPO:?GITHUB_REPO is required}"
 : "${GITHUB_TOKEN:?GITHUB_TOKEN is required}"
+: "${GITHUB_BRANCH:=master}"
+: "${WORKSPACE:=/workspace}"
 : "${RUN_TIME:=09:00}"
-: "${RUN_ON_START:=1}"
+: "${RUN_ON_START:=0}"
+: "${SCHEDULE_ENABLED:=0}"
+: "${TZ:=Etc/UTC}"
+export GH_TOKEN="$GITHUB_TOKEN" GITHUB_BRANCH WORKSPACE
+[[ "$RUN_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo 'RUN_TIME must be HH:MM'; exit 1; }
+[[ "$RUN_ON_START" =~ ^[01]$ && "$SCHEDULE_ENABLED" =~ ^[01]$ ]] || exit 1
+[[ -f "/usr/share/zoneinfo/$TZ" ]] || { echo 'Unknown TZ'; exit 1; }
+ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+printf '%s\n' "$TZ" > /etc/timezone
 
-export GH_TOKEN="$GITHUB_TOKEN"
-
+git config --global user.name BugBot
+git config --global user.email bugbot@localhost
+# Uses GH_TOKEN at runtime; never embeds the token in the remote URL.
+gh auth setup-git --hostname github.com
 mkdir -p "$WORKSPACE"
-git config --global user.name "BugBot"
-git config --global user.email "bugbot@localhost"
-
-# Clone or pull the repo. The named volume keeps reports/ across runs.
-if [ ! -d "$WORKSPACE/.git" ]; then
-    echo "[entrypoint] cloning $GITHUB_OWNER/$GITHUB_REPO"
-    git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git" "$WORKSPACE"
+url="https://github.com/$GITHUB_OWNER/$GITHUB_REPO.git"
+if [[ ! -d "$WORKSPACE/.git" ]]; then
+    git clone --branch "$GITHUB_BRANCH" --single-branch "$url" "$WORKSPACE"
 else
-    echo "[entrypoint] pulling latest"
-    git -C "$WORKSPACE" -c credential.helper= pull --ff-only "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git" master
+    git -C "$WORKSPACE" remote set-url origin "$url"
+    [[ "$(git -C "$WORKSPACE" branch --show-current)" == "$GITHUB_BRANCH" ]] || {
+        echo 'Workspace branch differs from GITHUB_BRANCH; inspect the volume before switching.'; exit 1;
+    }
 fi
 
-# Authenticate gh once so release/issue commands work.
-echo "$GITHUB_TOKEN" | gh auth login --with-token
-
-# Daily schedule in the container's local time.
-HOUR="${RUN_TIME%%:*}"
-MIN="${RUN_TIME##*:}"
-printf '%s %s * * * /opt/bugbot/run-daily.sh >> /var/log/bugbot.log 2>&1\n' "$MIN" "$HOUR" > /etc/cron.d/bugbot
-chmod 0644 /etc/cron.d/bugbot
-crontab /etc/cron.d/bugbot
-
-echo "[entrypoint] scheduled daily run at $RUN_TIME; running cron"
-
-if [ "$RUN_ON_START" = "1" ]; then
-    /opt/bugbot/run-daily.sh >> /var/log/bugbot.log 2>&1 || echo "[entrypoint] startup run-daily.sh exited non-zero (logged)"
+# Debian cron does not inherit the container environment. Save shell-quoted exports
+# for the scheduled wrapper, including any configured provider API keys.
+umask 077
+export -p > /run/bugbot-env
+cat > /run/bugbot-scheduled <<'WRAPPER'
+#!/bin/bash
+set -euo pipefail
+source /run/bugbot-env
+exec /opt/bugbot/run-daily.sh
+WRAPPER
+chmod 700 /run/bugbot-scheduled
+if [[ "$SCHEDULE_ENABLED" == 1 ]]; then
+    hour="${RUN_TIME%%:*}"; minute="${RUN_TIME##*:}"
+    printf '%d %d * * * root /run/bugbot-scheduled >> /var/log/bugbot.log 2>&1\n' \
+        "$((10#$minute))" "$((10#$hour))" > /etc/cron.d/bugbot
+    chmod 644 /etc/cron.d/bugbot
+    echo "Scheduled daily run at $RUN_TIME ($TZ)"
+else
+    rm -f /etc/cron.d/bugbot
+    echo 'Schedule disabled; ready for authentication and a manual test.'
 fi
-
+touch /var/log/bugbot.log
+if [[ "$RUN_ON_START" == 1 ]]; then
+    /opt/bugbot/run-daily.sh >> /var/log/bugbot.log 2>&1 || echo 'Startup run failed; see /var/log/bugbot.log'
+fi
 exec cron -f
