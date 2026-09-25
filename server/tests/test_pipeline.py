@@ -161,6 +161,23 @@ mv reports/queue/*.md reports/done/
         self.assertFalse(self.data()['releases'][0]['draft'])
         self.assertEqual(self.data()['closed'], ['1'])
 
+    def test_resume_does_not_regress_advanced_remote(self):
+        self.data(issues=[self.issue(1)])
+        self.assertNotEqual(self.run_script(FAIL_UPLOAD='1').returncode, 0)
+        remote_head = self.git('rev-parse', 'origin/master')
+        other = self.root / 'other'
+        subprocess.run(['git', 'clone', str(self.remote), str(other)], check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.name', 'T'], cwd=other, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.email', 't@e.i'], cwd=other, check=True, capture_output=True)
+        (other / 'deploy.txt').write_text('hand pushed\n')
+        subprocess.run(['git', 'add', '.'], cwd=other, check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-qm', 'deploy commit'], cwd=other, check=True, capture_output=True)
+        subprocess.run(['git', 'push'], cwd=other, check=True, capture_output=True)
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.data()['closed'], ['1'])
+        self.assertNotEqual(self.git('rev-parse', 'origin/master'), remote_head)
+
     def test_push_failure_does_not_release(self):
         self.write(self.remote / 'hooks/pre-receive', '#!/bin/sh\nexit 1\n')
         self.data(issues=[self.issue(1)])

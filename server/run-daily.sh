@@ -67,7 +67,17 @@ report="$(jq -r .report "$PENDING")"
 # Build must succeed before pushing or publishing anything.
 bash build.sh
 clean
-git push origin "HEAD:refs/heads/$GITHUB_BRANCH"
+# The branch may have advanced since this transaction started (e.g. deploy
+# commits pushed by hand). Never regress it; the release targets $sha
+# regardless of other commits ahead of it.
+git fetch origin
+if git merge-base --is-ancestor "origin/$GITHUB_BRANCH" HEAD; then
+    git push origin "HEAD:refs/heads/$GITHUB_BRANCH"
+elif git merge-base --is-ancestor "$sha" "origin/$GITHUB_BRANCH"; then
+    echo 'Remote already contains the release commit; not regressing branch'
+else
+    fail 'Remote branch diverged and does not contain the release commit; inspect'
+fi
 # Querying the list first distinguishes a missing release from an API failure.
 releases="$(gh api --paginate "repos/$REPO/releases?per_page=100")"
 release="$(jq -sc --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | .[0] // empty' <<<"$releases")"
