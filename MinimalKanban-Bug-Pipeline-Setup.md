@@ -137,6 +137,11 @@ Keep `RUN_ON_START=0` unless you also want processing every time the container
 starts. Debian cron receives the container environment through a root-readable
 runtime file. The entire pipeline is locked against overlapping runs.
 
+To react to a new ticket quickly instead of waiting for `RUN_TIME`, set
+`CHECK_INTERVAL_MIN` (e.g. `10`): the same pipeline then runs every N minutes,
+pulls, syncs open issues and exits immediately when nothing is queued. Leave it
+empty for the single daily run. Requires `SCHEDULE_ENABLED=1`.
+
 ## 6. Reports, releases and failure recovery
 
 - `reports/queue/`: pending reports, imported from open GitHub issues (not PRs).

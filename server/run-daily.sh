@@ -74,7 +74,10 @@ if [[ -z "$release" ]]; then
     [[ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ]] || fail 'Release tag already exists; inspect before proceeding'
     gh release create "$tag" --repo "$REPO" --target "$sha" --draft \
         --title "Minimal Kanban ${tag#v}" --notes 'Automated build from BugBot run.'
-    release="$(gh api "repos/$REPO/releases/tags/$tag")"
+    # A draft has no git tag yet, so lookup via the list endpoint, not tags/<tag>.
+    release="$(gh api --paginate "repos/$REPO/releases?per_page=100" \
+        | jq -sc --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | .[0] // empty')"
+    [[ -n "$release" ]] || fail 'Draft release not visible after create; inspect before proceeding'
 fi
 [[ "$(jq -r .target_commitish <<<"$release")" == "$sha" ]] || fail 'Release target differs from pending commit'
 if [[ "$(jq -r .draft <<<"$release")" == true ]]; then
