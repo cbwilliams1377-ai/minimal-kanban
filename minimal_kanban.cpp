@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <iterator>
 #include <fstream>
+#include <memory>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -23,6 +24,11 @@ struct Card {
     LONGLONG timerAccumulated = 0; // completed time from runs before this program run
     LONGLONG sessionAccumulated = 0; // this run's paused-session time; reset on app close
     LONGLONG timerStart = 0;       // QPC timestamp when running (0 = stopped)
+};
+
+struct Settings {
+    bool autoUpdate = false;
+    bool checkOnStartup = true;
 };
 
 // These global variables hold the board and the pieces of UI state shared by message handlers.
@@ -40,10 +46,15 @@ static const wchar_t* GITHUB_REPO = L"minimal-kanban";
 static const wchar_t* APP_VERSION = L"0.1.1";
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
+static Settings g_settings;
+static volatile LONG g_updateBusy = 0;
+static volatile LONG g_updateCancelled = 0;
 
 #define TIMER_LIVE 1                     // Timer ID for the live stopwatch tick.
 #define CARD_HEIGHT 60                   // Height of each card in pixels.
 #define CARD_SPACING 66                  // Vertical spacing between cards.
+#define WM_APP_UPDATE_CHECK (WM_APP + 1)
+#define WM_APP_UPDATE_RESULT (WM_APP + 2)
 
 // Context menu command IDs.
 #define CMD_EDIT 1
@@ -53,6 +64,7 @@ static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch up
 #define CMD_BLOCKED 5
 #define CMD_REPORT 6
 #define CMD_UPDATE 7
+#define CMD_AUTO_UPDATE 8
 
 // Owner-drawn menu item: the label plus the keyboard-hint shown right-aligned.
 struct MenuItemData { const wchar_t* text; const wchar_t* hint; };
@@ -72,6 +84,8 @@ static std::wstring AppLocalDir() {
 
 // Return the path where the board is saved.
 static std::wstring DataPath() { return AppLocalDir() + L"\\board.json"; }
+
+static std::wstring SettingsPath() { return AppLocalDir() + L"\\settings.json"; }
 
 // Convert Windows' UTF-16 string type to UTF-8 for the JSON file.
 static std::string Utf8(const std::wstring& s) {
@@ -185,6 +199,33 @@ static std::string JsonUnescape(const std::string& s) {
     return out;
 }
 
+static bool JsonBoolField(const std::string& json, const char* key, bool fallback) {
+    std::string quoted = std::string("\"") + key + "\"";
+    size_t p = json.find(quoted);
+    if (p == std::string::npos) return fallback;
+    size_t colon = json.find(':', p + quoted.size());
+    if (colon == std::string::npos) return fallback;
+    size_t value = colon + 1;
+    while (value < json.size() && (json[value] == ' ' || json[value] == '\t'
+        || json[value] == '\r' || json[value] == '\n')) ++value;
+    if (json.compare(value, 4, "true") == 0) return true;
+    if (json.compare(value, 5, "false") == 0) return false;
+    return fallback;
+}
+
+static std::wstring JsonStringField(const std::string& json, const char* key) {
+    std::string quoted = std::string("\"") + key + "\"";
+    size_t p = json.find(quoted);
+    if (p == std::string::npos) return {};
+    size_t colon = json.find(':', p + quoted.size());
+    if (colon == std::string::npos) return {};
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return {};
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return {};
+    return Wide(json.substr(q1 + 1, q2 - q1 - 1));
+}
+
 // Write every card to the board.json file.
 // Timers are NOT stopped here: TotalElapsedMs includes the whole current run
 // (accumulated history + session pauses + any in-flight stretch), so the saved
@@ -257,6 +298,22 @@ static void LoadCards() {
         }
         g_cards.push_back(card);
     }
+}
+
+static void LoadSettings() {
+    g_settings = Settings();
+    std::ifstream f(std::filesystem::path(SettingsPath()), std::ios::binary);
+    if (!f) return;
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    g_settings.autoUpdate = JsonStringField(json, "update_mode") == L"auto";
+    g_settings.checkOnStartup = JsonBoolField(json, "check_on_startup", true);
+}
+
+static void SaveSettings() {
+    std::ofstream f(std::filesystem::path(SettingsPath()), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f << "{\n  \"update_mode\": \"" << (g_settings.autoUpdate ? "auto" : "ask") << "\""
+      << ",\n  \"check_on_startup\": " << (g_settings.checkOnStartup ? "true" : "false") << "\n}\n";
 }
 
 // Paint a rectangle with one solid color, then release the temporary brush.
@@ -665,8 +722,107 @@ static int VersionCmp(const std::wstring& a, const std::wstring& b) {
     return 0;
 }
 
+static void InstallUpdate(HWND hwnd, const std::wstring& newPath);
+
+struct UpdateCheckRequest {
+    HWND hwnd = nullptr;
+    bool autoUpdate = false;
+};
+
+struct UpdateResult {
+    bool reached = false;
+    bool newer = false;
+    bool downloaded = false;
+    std::wstring tag;
+    std::wstring newPath;
+};
+
+static DWORD WINAPI UpdateCheckWorker(LPVOID param) {
+    std::unique_ptr<UpdateCheckRequest> request(static_cast<UpdateCheckRequest*>(param));
+    HRESULT coResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::unique_ptr<UpdateResult> result(new UpdateResult());
+    std::wstring dir = AppLocalDir();
+    std::wstring infoPath = dir + L"\\update_info.json";
+    DeleteFileW(infoPath.c_str());
+    if (SUCCEEDED(URLDownloadToFileW(nullptr, GitHubApiUrl(L"/releases/latest").c_str(), infoPath.c_str(), 0, nullptr))) {
+        std::ifstream f(std::filesystem::path(infoPath), std::ios::binary);
+        if (f) {
+            std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::wstring tag = ReadTagName(json);
+            if (!tag.empty()) {
+                result->reached = true;
+                result->tag = tag;
+                std::wstring latest = tag;
+                if (!latest.empty() && (latest[0] == L'v' || latest[0] == L'V')) latest = latest.substr(1);
+                result->newer = VersionCmp(latest, APP_VERSION) > 0;
+                result->newPath = dir + L"\\MinimalKanban.new.exe";
+                if (result->newer && request->autoUpdate) {
+                    DeleteFileW(result->newPath.c_str());
+                    result->downloaded = SUCCEEDED(URLDownloadToFileW(nullptr,
+                        GitHubRepoUrl(L"/releases/latest/download/MinimalKanban.exe").c_str(),
+                        result->newPath.c_str(), 0, nullptr));
+                }
+            }
+        }
+    }
+    if (SUCCEEDED(coResult)) CoUninitialize();
+    if (InterlockedCompareExchange(&g_updateCancelled, 0, 0) != 0) {
+        InterlockedExchange(&g_updateBusy, 0);
+        return 0;
+    }
+    if (!PostMessageW(request->hwnd, WM_APP_UPDATE_RESULT, 0, (LPARAM)result.get())) {
+        InterlockedExchange(&g_updateBusy, 0);
+        return 0;
+    }
+    result.release();
+    return 0;
+}
+
+static void StartStartupUpdateCheck(HWND hwnd) {
+    if (!g_settings.checkOnStartup) return;
+    if (InterlockedCompareExchange(&g_updateBusy, 1, 0) != 0) return;
+    UpdateCheckRequest* request = new UpdateCheckRequest{hwnd, g_settings.autoUpdate};
+    HANDLE thread = CreateThread(nullptr, 0, UpdateCheckWorker, request, 0, nullptr);
+    if (!thread) {
+        delete request;
+        InterlockedExchange(&g_updateBusy, 0);
+        return;
+    }
+    CloseHandle(thread);
+}
+
+static void HandleUpdateResult(HWND hwnd, UpdateResult* result) {
+    std::unique_ptr<UpdateResult> keep(result);
+    InterlockedExchange(&g_updateBusy, 0);
+    if (!result || !result->reached || !result->newer) return;
+    if (g_settings.autoUpdate) {
+        if (!result->downloaded) {
+            DeleteFileW(result->newPath.c_str());
+            if (FAILED(URLDownloadToFileW(nullptr, GitHubRepoUrl(L"/releases/latest/download/MinimalKanban.exe").c_str(),
+                result->newPath.c_str(), 0, nullptr))) {
+                MessageBoxW(hwnd, L"The automatic update could not be downloaded.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+                return;
+            }
+        }
+        InstallUpdate(hwnd, result->newPath);
+        return;
+    }
+    int answer = MessageBoxW(hwnd,
+        (L"A new version (" + result->tag + L") is available.\n\nDownload and install it now?").c_str(),
+        L"Check for Updates", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
+    if (answer != IDYES) return;
+    DeleteFileW(result->newPath.c_str());
+    if (FAILED(URLDownloadToFileW(nullptr, GitHubRepoUrl(L"/releases/latest/download/MinimalKanban.exe").c_str(),
+        result->newPath.c_str(), 0, nullptr))) {
+        MessageBoxW(hwnd, L"The update failed to download.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    InstallUpdate(hwnd, result->newPath);
+}
+
 // Swap in the freshly downloaded exe after this process exits, then relaunch from LocalAppData.
 static void InstallUpdate(HWND hwnd, const std::wstring& newPath) {
+    SaveCards();
     std::wstring dest = AppLocalDir() + L"\\MinimalKanban.exe";
     std::wstring cmd = L"cmd.exe /c ping -n 4 127.0.0.1 >nul & move /y \""
         + newPath + L"\" \"" + dest + L"\" & start \"\" \"" + dest + L"\"";
@@ -686,39 +842,60 @@ static void InstallUpdate(HWND hwnd, const std::wstring& newPath) {
 
 // Check the latest GitHub release, download it if newer, install and restart.
 static void UpdateCheck(HWND hwnd) {
+    if (InterlockedCompareExchange(&g_updateBusy, 1, 0) != 0) return;
     if (wcscmp(GITHUB_OWNER, L"your-github-username") == 0) {
         MessageBoxW(hwnd, L"Set the GitHub owner for this build in minimal_kanban.cpp, then rebuild.",
             L"Check for Updates", MB_OK | MB_ICONWARNING);
+        InterlockedExchange(&g_updateBusy, 0);
         return;
     }
     std::wstring dir = AppLocalDir();
     std::wstring infoPath = dir + L"\\update_info.json";
     std::wstring newPath = dir + L"\\MinimalKanban.new.exe";
+    DeleteFileW(infoPath.c_str());
     if (FAILED(URLDownloadToFileW(nullptr, GitHubApiUrl(L"/releases/latest").c_str(), infoPath.c_str(), 0, nullptr))) {
         MessageBoxW(hwnd, L"Could not reach GitHub to check for updates.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        InterlockedExchange(&g_updateBusy, 0);
         return;
     }
     std::ifstream f(std::filesystem::path(infoPath), std::ios::binary);
-    if (!f) { MessageBoxW(hwnd, L"Could not read the release info.", L"Check for Updates", MB_OK | MB_ICONWARNING); return; }
+    if (!f) {
+        MessageBoxW(hwnd, L"Could not read the release info.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        InterlockedExchange(&g_updateBusy, 0);
+        return;
+    }
     std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     std::wstring tag = ReadTagName(json);
-    if (tag.empty()) { MessageBoxW(hwnd, L"Could not read the release info.", L"Check for Updates", MB_OK | MB_ICONWARNING); return; }
+    if (tag.empty()) {
+        MessageBoxW(hwnd, L"Could not read the release info.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        InterlockedExchange(&g_updateBusy, 0);
+        return;
+    }
     std::wstring latest = tag;
     if (!latest.empty() && (latest[0] == L'v' || latest[0] == L'V')) latest = latest.substr(1);
     if (VersionCmp(latest, APP_VERSION) <= 0) {
         MessageBoxW(hwnd, (L"You're up to date (v" + std::wstring(APP_VERSION) + L").").c_str(),
             L"Check for Updates", MB_OK | MB_ICONINFORMATION);
+        InterlockedExchange(&g_updateBusy, 0);
         return;
     }
-    int res = MessageBoxW(hwnd,
-        (L"A new version (" + tag + L") is available.\n\nDownload and install it now?").c_str(),
-        L"Check for Updates", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
-    if (res != IDYES) return;
+    if (!g_settings.autoUpdate) {
+        int res = MessageBoxW(hwnd,
+            (L"A new version (" + tag + L") is available.\n\nDownload and install it now?").c_str(),
+            L"Check for Updates", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
+        if (res != IDYES) {
+            InterlockedExchange(&g_updateBusy, 0);
+            return;
+        }
+    }
+    DeleteFileW(newPath.c_str());
     if (FAILED(URLDownloadToFileW(nullptr, GitHubRepoUrl(L"/releases/latest/download/MinimalKanban.exe").c_str(), newPath.c_str(), 0, nullptr))) {
         MessageBoxW(hwnd, L"The update failed to download.", L"Check for Updates", MB_OK | MB_ICONWARNING);
+        InterlockedExchange(&g_updateBusy, 0);
         return;
     }
     InstallUpdate(hwnd, newPath);
+    InterlockedExchange(&g_updateBusy, 0);
 }
 
 // Window procedure for the main board window.
@@ -804,18 +981,26 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (target < 0) {
             // Global menu when the click is on empty board space.
             POINT screen = p; ClientToScreen(hwnd, &screen);
+            std::wstring autoUpdateLabel = L"Automatic updates: ";
+            autoUpdateLabel += g_settings.autoUpdate ? L"auto" : L"ask";
+            std::wstring autoUpdateHint = L"(click to change)";
             MenuItemData globalItems[] = {
-                { L"Report a Bug",     L"(ctrl+r)" },
-                { L"Check for Updates", L"(ctrl+u)" },
+                { L"Report a Bug",       L"(ctrl+r)" },
+                { L"Check for Updates",  L"(ctrl+u)" },
+                { autoUpdateLabel.c_str(), autoUpdateHint.c_str() },
             };
-            const int globalCmds[] = { CMD_REPORT, CMD_UPDATE };
+            const int globalCmds[] = { CMD_REPORT, CMD_UPDATE, CMD_AUTO_UPDATE };
             HMENU menu = CreatePopupMenu();
-            for (int i = 0; i < 2; ++i)
+            for (size_t i = 0; i < _countof(globalItems); ++i)
                 AppendMenuW(menu, MF_OWNERDRAW, globalCmds[i], (LPCTSTR)&globalItems[i]);
             int cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, hwnd, nullptr);
             DestroyMenu(menu);
             if (cmd == CMD_REPORT) ReportBug(hwnd);
             else if (cmd == CMD_UPDATE) UpdateCheck(hwnd);
+            else if (cmd == CMD_AUTO_UPDATE) {
+                g_settings.autoUpdate = !g_settings.autoUpdate;
+                SaveSettings();
+            }
             return 0;
         }
         POINT screen = p; ClientToScreen(hwnd, &screen);
@@ -907,6 +1092,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Cancel the drag if Windows takes mouse capture away from this window.
         if (g_dragIndex >= 0) { g_dragIndex = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
+    case WM_APP_UPDATE_CHECK:
+        StartStartupUpdateCheck(hwnd);
+        return 0;
+    case WM_APP_UPDATE_RESULT:
+        HandleUpdateResult(hwnd, (UpdateResult*)lp);
+        return 0;
     case WM_TIMER:
         // Live timer tick: redraw to update running stopwatch displays.
         if (wp == TIMER_LIVE) {
@@ -995,6 +1186,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         // Save before closing, release GDI font objects, and end the message loop.
+        InterlockedExchange(&g_updateCancelled, 1);
         StopLiveTimer(hwnd);
         SaveCards(); if (g_font) DeleteObject(g_font); if (g_boldFont) DeleteObject(g_boldFont); PostQuitMessage(0); return 0;
     }
@@ -1030,6 +1222,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     timeClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); timeClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassExW(&timeClass);
     LoadCards(); // Restore the previous board before showing the window.
+    LoadSettings();
     // Create the actual main window using the class registered above.
     HWND hwnd = CreateWindowExW(0, MAIN_CLASS, L"Minimal Kanban", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 920, 520, nullptr, nullptr, instance, nullptr);
@@ -1037,6 +1230,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetDarkTitleBar(hwnd);
     ShowWindow(hwnd, show); // Make the window visible.
     UpdateWindow(hwnd); // Ask Windows to send WM_PAINT immediately.
+    PostMessageW(hwnd, WM_APP_UPDATE_CHECK, 0, 0);
     // The main message loop dispatches mouse, keyboard, paint, and close events.
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     CoUninitialize(); return (int)msg.wParam;
