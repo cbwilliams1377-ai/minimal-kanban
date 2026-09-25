@@ -564,6 +564,7 @@ static void ToggleTimer(HWND hwnd, int index) {
         g_cards[index].timerStart = 0;
         if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     } else {
+        if (AnyTimerRunning()) return;
         g_cards[index].timerStart = NowMs();
         StartLiveTimer(hwnd);
     }
