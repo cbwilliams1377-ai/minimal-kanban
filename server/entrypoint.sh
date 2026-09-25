@@ -18,6 +18,7 @@ export GH_TOKEN="$GITHUB_TOKEN" GITHUB_BRANCH WORKSPACE
 ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
 printf '%s\n' "$TZ" > /etc/timezone
 
+git config --global --add safe.directory /workspace
 git config --global user.name BugBot
 git config --global user.email bugbot@localhost
 # Uses GH_TOKEN at runtime; never embeds the token in the remote URL.

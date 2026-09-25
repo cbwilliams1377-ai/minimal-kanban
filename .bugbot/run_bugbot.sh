@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # BugBot daily runner for Linux/macOS. Mirrors run_bugbot.ps1.
 # Usage: ./run_bugbot.sh
+
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +41,7 @@ fi
 
 MODEL="$(cfg_get model)"
 [ -n "$MODEL" ] || { write_log "ERROR: model missing from config.json. Aborting."; exit 1; }
+FALLBACK_MODEL="${FALLBACK_MODEL:-opencode/nemotron-3.5-lightning-free}"
 
 OC="$(cfg_get opencodePath)"
 [ -n "$OC" ] || OC=opencode
@@ -67,11 +69,28 @@ if [ -z "$oldest" ]; then
 fi
 
 write_log "Processing report: $oldest"
-write_log "Running: $OC run --dir <workspace> --model $MODEL --auto (prompt = BUGBOT.md)"
 
-prompt="$(cat "$PROMPT_FILE")"
-"$OC" run --dir "$WORKSPACE" --model "$MODEL" --auto "$prompt" 2>&1 | tee -a "$LOG"
-statuses=("${PIPESTATUS[@]}")
-write_log "Exit code: ${statuses[0]}"
-(( statuses[0] == 0 )) || exit "${statuses[0]}"
-exit "${statuses[1]}"
+run_with_fallback() {
+    local primary="$1"
+    local fallback="$2"
+    local run_failed=0
+
+    write_log "Running: $OC run --dir $WORKSPACE --model $primary --auto (prompt = BUGBOT.md)"
+    local prompt="$(cat "$PROMPT_FILE")"
+    "$OC" run --dir "$WORKSPACE" --model "$primary" --auto "$prompt" 2>&1 | tee -a "$LOG"
+    statuses=("${PIPESTATUS[@]}")
+    write_log "Primary model $primary exit code: ${statuses[0]}"
+    if (( statuses[0] == 0 )); then
+        exit "${statuses[1]}"
+    fi
+
+    run_failed=1
+    write_log "WARN: primary model $primary failed (exit ${statuses[0]}). Falling back to $fallback"
+    write_log "Running: $OC run --dir $WORKSPACE --model $fallback --auto (prompt = BUGBOT.md)"
+    "$OC" run --dir "$WORKSPACE" --model "$fallback" --auto "$prompt" 2>&1 | tee -a "$LOG"
+    fallback_statuses=("${PIPESTATUS[@]}")
+    write_log "Fallback model $fallback exit code: ${fallback_statuses[0]}"
+    exit "${fallback_statuses[0]}"
+}
+
+run_with_fallback "$MODEL" "$FALLBACK_MODEL"

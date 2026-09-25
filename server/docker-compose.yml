@@ -4,14 +4,10 @@ services:
     container_name: bugbot
     env_file: .env
     volumes:
-      - bugbot-work:/workspace
-      - bugbot-opencode:/root/.config/opencode
-      - bugbot-opencode-data:/root/.local/share/opencode
-      - bugbot-logs:/var/log
+      - /opt/servers/stacks/bugbot/work:/workspace
+      - /opt/servers/stacks/bugbot/opencode:/root/.config/opencode
+      - /opt/servers/stacks/bugbot/opencode-data:/root/.local/share/opencode
+      - /opt/servers/stacks/bugbot/logs:/var/log
     restart: unless-stopped
 
-volumes:
-  bugbot-work:
-  bugbot-opencode:
-  bugbot-opencode-data:
-  bugbot-logs:
+volumes: {}
