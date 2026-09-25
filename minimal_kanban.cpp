@@ -37,6 +37,7 @@ static HFONT g_font = nullptr, g_boldFont = nullptr; // Fonts used while drawing
 static int g_dragIndex = -1; // Index of the card being dragged; -1 means no drag is active.
 static POINT g_dragPoint{}; // Current mouse position while dragging a card.
 static POINT g_lastMouse{}; // Last known mouse position, used for hover-based keyboard actions.
+static int g_selected = -1; // Index of the card chosen with the keyboard; -1 means nothing is selected.
 static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main window class.
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
@@ -813,6 +814,53 @@ static int HoverIndex(const RECT& client, const POINT& p) {
     return -1;
 }
 
+// The card indices in the order they appear on screen: column by column, top to bottom.
+static std::vector<int> VisibleOrder() {
+    std::vector<int> order;
+    for (int c = 0; c < 3; ++c)
+        for (size_t i = 0; i < g_cards.size(); ++i)
+            if (g_cards[i].column == c) order.push_back((int)i);
+    return order;
+}
+
+// Move the keyboard selection one card up (-1) or down (+1) in on-screen order.
+// With nothing selected yet, stepping down starts at the top card and stepping
+// up starts at the bottom one; the selection stops at the ends instead of wrapping.
+static void SelectStep(HWND hwnd, int delta) {
+    std::vector<int> order = VisibleOrder();
+    if (order.empty()) { g_selected = -1; InvalidateRect(hwnd, nullptr, FALSE); return; }
+    int pos = -1;
+    for (size_t i = 0; i < order.size(); ++i) if (order[i] == g_selected) { pos = (int)i; break; }
+    if (pos < 0) pos = delta > 0 ? -1 : (int)order.size();
+    int next = pos + delta;
+    if (next < 0 || next >= (int)order.size()) return; // Already at the first/last card.
+    g_selected = order[next];
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// Move the selected card one column left (-1) or right (+1); it stays selected afterwards.
+static void MoveSelectedColumn(HWND hwnd, int delta) {
+    if (g_selected < 0 || g_selected >= (int)g_cards.size()) return;
+    int column = g_cards[g_selected].column + delta;
+    if (column < 0 || column > 2) return; // Already in the first/last column.
+    g_cards[g_selected].column = column;
+    SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// The card a keyboard action applies to: the one under the mouse if there is one,
+// otherwise the card picked with the arrow keys.
+static int ActionIndex(HWND hwnd) {
+    RECT client{}; GetClientRect(hwnd, &client);
+    int hover = HoverIndex(client, g_lastMouse);
+    return hover >= 0 ? hover : g_selected;
+}
+
+// Keep the keyboard selection on the same card after one is erased from the vector.
+static void FixSelectionAfterErase(int erased) {
+    if (g_selected == erased) g_selected = -1;
+    else if (g_selected > erased) --g_selected;
+}
+
 // Percent-encode a string for use in a URL query string (UTF-8 aware).
 static std::string UrlEncode(const std::wstring& s) {
     std::string u8 = Utf8(s);
@@ -1096,10 +1144,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == 'U' && (GetKeyState(VK_CONTROL) & 0x8000)) { UpdateCheck(hwnd); return 0; }
-        // Hover-based keyboard actions operate on the card under the last mouse position.
+        // Arrow keys drive the board without a mouse: up/down pick the card to act on,
+        // left/right move that card between columns.
+        if (wp == VK_UP || wp == VK_DOWN) { SelectStep(hwnd, wp == VK_DOWN ? 1 : -1); return 0; }
+        if (wp == VK_LEFT || wp == VK_RIGHT) { MoveSelectedColumn(hwnd, wp == VK_RIGHT ? 1 : -1); return 0; }
+        // The remaining keyboard actions apply to the card under the last mouse position,
+        // or to the keyboard-selected card when the mouse is not over one.
         if (wp == VK_SPACE || wp == VK_DELETE || wp == 'D' || wp == 'S' || wp == 'T' || wp == 'B') {
-            RECT client{}; GetClientRect(hwnd, &client);
-            int hover = HoverIndex(client, g_lastMouse);
+            int hover = ActionIndex(hwnd);
             if (hover < 0) return 0;
             if (wp == VK_SPACE) {
                 // Edit card text.
@@ -1111,6 +1163,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (wp == VK_DELETE || wp == 'D') {
                 // Delete card.
                 g_cards.erase(g_cards.begin() + hover);
+                FixSelectionAfterErase(hover);
                 SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
             } else if (wp == 'S') {
                 ToggleTimer(hwnd, hover);
@@ -1221,6 +1274,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case CMD_DELETE:
             g_cards.erase(g_cards.begin() + target);
+            FixSelectionAfterErase(target);
             SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CMD_TOGGLE_TIMER:
@@ -1331,18 +1385,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto rects = CardRects(client);
         HPEN penBlocked = CreatePen(PS_SOLID, 3, RGB(220, 50, 50));
         HPEN penTimer = CreatePen(PS_SOLID, 3, RGB(50, 180, 50));
+        HPEN penSelected = CreatePen(PS_SOLID, 3, RGB(60, 130, 230));
         HPEN penOld = (HPEN)SelectObject(mem, GetStockObject(NULL_PEN));
         HBRUSH brOld = (HBRUSH)SelectObject(mem, GetStockObject(NULL_BRUSH));
         for (auto [index, r] : rects) {
             if (index == g_dragIndex) continue;
             // Card background.
             Fill(mem, r, RGB(50,50,50));
-            // Draw outline: blocked (red) or timer running (green). Blocked takes priority visually.
+            // Draw outline: blocked (red) or timer running (green); the keyboard selection
+            // is blue and only shows when neither of those applies.
             if (g_cards[index].blocked) {
                 SelectObject(mem, penBlocked);
                 Rectangle(mem, r.left, r.top, r.right, r.bottom);
             } else if (g_cards[index].timerStart != 0) {
                 SelectObject(mem, penTimer);
+                Rectangle(mem, r.left, r.top, r.right, r.bottom);
+            } else if (index == g_selected) {
+                SelectObject(mem, penSelected);
                 Rectangle(mem, r.left, r.top, r.right, r.bottom);
             }
             // Task text.
@@ -1372,7 +1431,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DrawTextW(mem, g_cards[g_dragIndex].text.c_str(), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         }
         SelectObject(mem, penOld); SelectObject(mem, brOld);
-        DeleteObject(penBlocked); DeleteObject(penTimer);
+        DeleteObject(penBlocked); DeleteObject(penTimer); DeleteObject(penSelected);
         BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, oldBitmap); DeleteObject(bitmap); DeleteDC(mem); EndPaint(hwnd, &ps); return 0;
     }

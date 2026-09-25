@@ -2,7 +2,7 @@
 
 ## Overview
 
-A minimal, self-contained Kanban board for Windows. Single-file C++ application (~750 lines) using raw Win32 API — no frameworks, no external dependencies. Dark-themed UI with three columns (Todo, In-Progress, Complete), drag-and-drop card movement, right-click context menus (Edit/Delete), per-card blocked flag and stopwatch timer, and persistence via a hand-rolled JSON file.
+A minimal, self-contained Kanban board for Windows. Single-file C++ application (~750 lines) using raw Win32 API — no frameworks, no external dependencies. Dark-themed UI with three columns (Todo, In-Progress, Complete), drag-and-drop and keyboard card movement, right-click context menus (Edit/Delete), per-card blocked flag and stopwatch timer, and persistence via a hand-rolled JSON file.
 
 ## Tech Stack
 
@@ -52,6 +52,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `g_dragIndex` — index of card being dragged (-1 = none).
 - `g_dragPoint` — mouse position during drag.
 - `g_lastMouse` — last known mouse position, drives hover-based keyboard actions.
+- `g_selected` — index of the card picked with the arrow keys (-1 = nothing selected).
 - `MAIN_CLASS` / `INPUT_CLASS` / `TIME_CLASS` / `PROMPT_CLASS` — Win32 window class names.
 - `TITLES[3]` — column header strings.
 - `g_qpcFreq` — QPC frequency for stopwatch timing.
@@ -91,6 +92,11 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time).
 - `ToggleBlocked(HWND, index)` — shared blocked-flag toggle (used by Ctrl+click, `B` key, and menu).
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
+- `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom).
+- `SelectStep(HWND, delta)` — moves the keyboard selection one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
+- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it stays selected afterwards.
+- `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the keyboard-selected card.
+- `FixSelectionAfterErase(int)` — keeps `g_selected` on the same card after a deletion shifts the vector.
 
 ### GDI Drawing Helpers (lines 229–276)
 
@@ -132,7 +138,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — Ctrl+N triggers AddCard. **Ctrl+R** opens the structured bug report, **Ctrl+Shift+R** the free-form prompt, **Ctrl+U** the update check. Hover-based actions on the card under `g_lastMouse`: **Space** (edit), **Delete / D** (delete), **S** (toggle stopwatch), **T** (edit timer), **B** (toggle blocked).
+- **WM_KEYDOWN** — Ctrl+N triggers AddCard. **Ctrl+R** opens the structured bug report, **Ctrl+Shift+R** the free-form prompt, **Ctrl+U** the update check. **Up/Down** walk the board and select a card (blue outline); **Left/Right** move the selected card one column left/right. The remaining actions (the card under `g_lastMouse`, or the selected one when the mouse is not over a card): **Space** (edit), **Delete / D** (delete), **S** (toggle stopwatch), **T** (edit timer), **B** (toggle blocked).
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
 - **WM_LBUTTONUP** — drops card into whichever column the mouse is over.
@@ -144,7 +150,7 @@ Handles all main board interactions:
 - **WM_ERASEBKGND** — returns 1 (all painting happens in WM_PAINT).
 - **WM_PAINT** — double-buffered painting:
   - Background RGB(27,27,27), column backgrounds RGB(39,39,39), headers RGB(43,43,43).
-  - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. Blocked takes drawing priority over green.
+  - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. The **keyboard-selected** card gets a blue (RGB(60,130,230)) 3px outline. Blocked and running take drawing priority over the blue selection outline.
   - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live countup** right-justified in green (RGB(50,180,50)) with a `+` prefix. The countup shows while running and stays frozen on the last value when paused; it only resets when the program closes (closing/saving appends the run to the total).
 - **WM_DESTROY** — stops live timer, saves (the whole current run is folded into the persisted total; it restores stopped with `sessionAccumulated` reset), frees fonts, posts quit.
 
@@ -186,9 +192,10 @@ All network use is on-demand — there are no threads, timers, or persistent con
 
 ## Card Interactions
 
-| Action | Mouse | Keyboard (hover over card) |
-|--------|-------|----------------------------|
-| Move card between columns | Drag (plain click) | — (mouse-only) |
+| Action | Mouse | Keyboard |
+|--------|-------|----------|
+| Select a card | Hover the pointer over it | **Up** / **Down** (blue outline) |
+| Move card between columns | Drag (plain click) | **Left** / **Right** on the selected card |
 | Toggle stopwatch start/stop (starts a running stopwatch on the other card) | Shift+left-click | **S** |
 | Toggle blocked flag (red outline) | Ctrl+left-click | **B** |
 | Edit card text | Right-click → Edit | **Space** |
@@ -199,7 +206,7 @@ All network use is on-demand — there are no threads, timers, or persistent con
 | File a report in your own words (opens browser) | Right-click empty space → Report with Prompt... | **Ctrl+Shift+R** |
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 
-Hover-based keyboard actions use the card under the last known mouse position; they no-op if the cursor isn't over a card.
+Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The selected card is outlined in blue, and the red (blocked) and green (running) outlines take visual priority.
 
 ## Dialog Interactions
 
