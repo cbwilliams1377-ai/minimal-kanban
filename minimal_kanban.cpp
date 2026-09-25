@@ -40,6 +40,7 @@ static POINT g_lastMouse{}; // Last known mouse position, used for hover-based k
 static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main window class.
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
+static const wchar_t* PROMPT_CLASS = L"MinimalKanbanReportPrompt"; // Name of the report prompt window class.
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
@@ -65,6 +66,12 @@ static volatile LONG g_updateCancelled = 0;
 #define CMD_REPORT 6
 #define CMD_UPDATE 7
 #define CMD_AUTO_UPDATE 8
+#define CMD_REPORT_PROMPT 9
+
+// Size limits for the natural-language report prompt dialog.
+#define PROMPT_CLIENT_W 460 // Dialog client width in pixels.
+#define PROMPT_CLIENT_H 180 // Dialog client height in pixels.
+#define PROMPT_LIMIT 4000  // Max characters accepted so the issue URL never gets unwieldy.
 
 // Owner-drawn menu item: the label plus the keyboard-hint shown right-aligned.
 struct MenuItemData { const wchar_t* text; const wchar_t* hint; };
@@ -611,6 +618,114 @@ static void AskForTime(HWND hwnd, int cardIndex) {
     g_timeInput = nullptr;
 }
 
+// Remove leading and trailing spaces and tabs from a string.
+static std::wstring Trim(const std::wstring& s) {
+    size_t b = s.find_first_not_of(L" \t");
+    if (b == std::wstring::npos) return {};
+    size_t e = s.find_last_not_of(L" \t");
+    return s.substr(b, e - b + 1);
+}
+
+// State for the natural-language report prompt dialog.
+struct PromptState { HWND edit = nullptr; bool done = false; bool accepted = false; std::wstring text; };
+static PromptState* g_prompt = nullptr;
+
+// Window procedure for the report prompt dialog: a dark multiline box with Submit/Cancel.
+static LRESULT CALLBACK PromptInputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        HWND hint = CreateWindowW(L"STATIC", L"Describe what you want changed in your own words.",
+            WS_CHILD | WS_VISIBLE, 16, 10, 428, 20, hwnd, (HMENU)101, GetModuleHandleW(nullptr), nullptr);
+        g_prompt->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+            16, 34, 428, 106, hwnd, (HMENU)100, GetModuleHandleW(nullptr), nullptr);
+        // Submit is deliberately not the default button: the edit box has ES_WANTRETURN, so a
+        // default button would make Enter both insert a newline and submit the dialog.
+        HWND submitButton = CreateWindowW(L"BUTTON", L"Submit", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            288, 150, 75, 28, hwnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
+        HWND cancelButton = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            369, 150, 75, 28, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+        HMODULE uxtheme = LoadLibraryW(L"uxtheme.dll");
+        if (uxtheme) {
+            using SetWindowThemeFn = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+            auto setWindowTheme = reinterpret_cast<SetWindowThemeFn>(GetProcAddress(uxtheme, "SetWindowTheme"));
+            if (setWindowTheme) { setWindowTheme(submitButton, L"", L""); setWindowTheme(cancelButton, L"", L""); }
+            FreeLibrary(uxtheme);
+        }
+        for (HWND child = hint; child; child = GetWindow(child, GW_HWNDNEXT))
+            SendMessageW(child, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SendMessageW(g_prompt->edit, EM_SETLIMITTEXT, PROMPT_LIMIT, 0);
+        SetFocus(g_prompt->edit);
+        return 0;
+    }
+    case WM_ERASEBKGND: { RECT client{}; GetClientRect(hwnd, &client); Fill((HDC)wp, client, RGB(32,32,32)); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp; SetTextColor(dc, RGB(230,230,230)); SetBkColor(dc, RGB(32,32,32));
+        static HBRUSH brush = CreateSolidBrush(RGB(32,32,32)); return (LRESULT)brush;
+    }
+    case WM_CTLCOLORBTN: {
+        HDC dc = (HDC)wp; SetTextColor(dc, RGB(230,230,230)); SetBkColor(dc, RGB(50,50,50));
+        static HBRUSH brush = CreateSolidBrush(RGB(50,50,50)); return (LRESULT)brush;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* ds = (DRAWITEMSTRUCT*)lp;
+        if (ds->CtlType == ODT_BUTTON) {
+            HBRUSH br = CreateSolidBrush(RGB(50,50,50));
+            FillRect(ds->hDC, &ds->rcItem, br); DeleteObject(br);
+            SetTextColor(ds->hDC, RGB(230,230,230)); SetBkMode(ds->hDC, TRANSPARENT);
+            wchar_t buf[64]; GetWindowTextW(ds->hwndItem, buf, 64);
+            DrawTextW(ds->hDC, buf, -1, &ds->rcItem, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            if (ds->itemState & ODS_FOCUS) { RECT r = ds->rcItem; InflateRect(&r, -3, -3); DrawFocusRect(ds->hDC, &r); }
+            return TRUE;
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            int n = GetWindowTextLengthW(g_prompt->edit);
+            std::wstring text(n + 1, L'\0');
+            GetWindowTextW(g_prompt->edit, text.data(), n + 1);
+            text.resize(n);
+            // Ignore a blank prompt so Submit never opens an empty issue.
+            if (!Trim(text).empty()) { g_prompt->text = text; g_prompt->accepted = true; }
+            DestroyWindow(hwnd); return 0;
+        }
+        if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_prompt->done = true; return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Show the report prompt dialog and wait until the user submits or cancels it.
+static bool AskForReportPrompt(HWND owner, std::wstring& out) {
+    PromptState state;
+    g_prompt = &state;
+    const DWORD style = WS_CAPTION | WS_SYSMENU;
+    const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+    // Size the window from the desired client area so the controls always fit.
+    RECT frame{0, 0, PROMPT_CLIENT_W, PROMPT_CLIENT_H};
+    AdjustWindowRectEx(&frame, style, FALSE, exStyle);
+    int w = frame.right - frame.left, h = frame.bottom - frame.top;
+    RECT pr{}; GetWindowRect(owner, &pr);
+    int x = pr.left + (pr.right - pr.left - w) / 2;
+    int y = pr.top + (pr.bottom - pr.top - h) / 2;
+    EnableWindow(owner, FALSE); // Make the main window temporarily non-interactive.
+    HWND dlg = CreateWindowExW(exStyle, PROMPT_CLASS, L"Report with your own words",
+        style | WS_VISIBLE, x, y, w, h, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!dlg) { EnableWindow(owner, TRUE); g_prompt = nullptr; return false; }
+    SetDarkTitleBar(dlg);
+    // Modal message loop: process dialog messages until it closes.
+    MSG msg;
+    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    EnableWindow(owner, TRUE); SetForegroundWindow(owner); g_prompt = nullptr;
+    if (state.accepted) out = state.text;
+    return state.accepted;
+}
+
 // Toggle the stopwatch for a card: start when stopped, pause when running.
 // Pausing freezes the in-flight stretch into sessionAccumulated instead of the
 // accumulated total, so the live countup keeps displaying the value (it only
@@ -691,6 +806,19 @@ static void ReportBug(HWND hwnd) {
     body += L"## Expected behavior\n\n\n";
     body += L"## Notes\n\n";
     std::wstring url = GitHubRepoUrl(L"/issues/new?title=") + Wide(UrlEncode(title)) + L"&body=" + Wide(UrlEncode(body));
+    ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Ask for the report in the user's own words, then open a pre-filled issue carrying that text.
+// The title is the first line of the prompt so the issue list stays readable; the body is verbatim.
+static void ReportBugWithPrompt(HWND hwnd) {
+    std::wstring prompt;
+    if (!AskForReportPrompt(hwnd, prompt)) return;
+    std::wstring firstLine = prompt.substr(0, prompt.find_first_of(L"\r\n"));
+    std::wstring title = Trim(firstLine);
+    if (title.size() > 64) title.resize(64);
+    if (title.empty()) title = L"Bug report from app";
+    std::wstring url = GitHubRepoUrl(L"/issues/new?title=") + Wide(UrlEncode(title)) + L"&body=" + Wide(UrlEncode(prompt));
     ShellExecuteW(hwnd, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
@@ -904,7 +1032,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         // Ctrl+N is a keyboard shortcut for adding a card.
         if (wp == 'N' && (GetKeyState(VK_CONTROL) & 0x8000)) { AddCard(hwnd); return 0; }
-        if (wp == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) { ReportBug(hwnd); return 0; }
+        if (wp == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            // Ctrl+Shift+R opens the free-form prompt; plain Ctrl+R keeps the structured template.
+            if (GetKeyState(VK_SHIFT) & 0x8000) ReportBugWithPrompt(hwnd); else ReportBug(hwnd);
+            return 0;
+        }
         if (wp == 'U' && (GetKeyState(VK_CONTROL) & 0x8000)) { UpdateCheck(hwnd); return 0; }
         // Hover-based keyboard actions operate on the card under the last mouse position.
         if (wp == VK_SPACE || wp == VK_DELETE || wp == 'D' || wp == 'S' || wp == 'T' || wp == 'B') {
@@ -985,17 +1117,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             autoUpdateLabel += g_settings.autoUpdate ? L"auto" : L"ask";
             std::wstring autoUpdateHint = L"(click to change)";
             MenuItemData globalItems[] = {
-                { L"Report a Bug",       L"(ctrl+r)" },
-                { L"Check for Updates",  L"(ctrl+u)" },
-                { autoUpdateLabel.c_str(), autoUpdateHint.c_str() },
+                { L"Report a Bug",          L"(ctrl+r)"       },
+                { L"Report with Prompt...", L"(ctrl+shift+r)" },
+                { L"Check for Updates",     L"(ctrl+u)"       },
+                { autoUpdateLabel.c_str(),  autoUpdateHint.c_str() },
             };
-            const int globalCmds[] = { CMD_REPORT, CMD_UPDATE, CMD_AUTO_UPDATE };
+            const int globalCmds[] = { CMD_REPORT, CMD_REPORT_PROMPT, CMD_UPDATE, CMD_AUTO_UPDATE };
             HMENU menu = CreatePopupMenu();
             for (size_t i = 0; i < _countof(globalItems); ++i)
                 AppendMenuW(menu, MF_OWNERDRAW, globalCmds[i], (LPCTSTR)&globalItems[i]);
             int cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, hwnd, nullptr);
             DestroyMenu(menu);
             if (cmd == CMD_REPORT) ReportBug(hwnd);
+            else if (cmd == CMD_REPORT_PROMPT) ReportBugWithPrompt(hwnd);
             else if (cmd == CMD_UPDATE) UpdateCheck(hwnd);
             else if (cmd == CMD_AUTO_UPDATE) {
                 g_settings.autoUpdate = !g_settings.autoUpdate;
@@ -1221,6 +1355,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     timeClass.lpfnWndProc = TimeInputProc; timeClass.hInstance = instance; timeClass.lpszClassName = L"MinimalKanbanTimeInput";
     timeClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); timeClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassExW(&timeClass);
+    // Register the natural-language report prompt dialog class.
+    WNDCLASSEXW promptClass{sizeof(promptClass)};
+    promptClass.lpfnWndProc = PromptInputProc; promptClass.hInstance = instance; promptClass.lpszClassName = PROMPT_CLASS;
+    promptClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); promptClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassExW(&promptClass);
     LoadCards(); // Restore the previous board before showing the window.
     LoadSettings();
     // Create the actual main window using the class registered above.

@@ -52,13 +52,13 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `g_dragIndex` — index of card being dragged (-1 = none).
 - `g_dragPoint` — mouse position during drag.
 - `g_lastMouse` — last known mouse position, drives hover-based keyboard actions.
-- `MAIN_CLASS` / `INPUT_CLASS` / `TIME_CLASS` — Win32 window class names.
+- `MAIN_CLASS` / `INPUT_CLASS` / `TIME_CLASS` / `PROMPT_CLASS` — Win32 window class names.
 - `TITLES[3]` — column header strings.
 - `g_qpcFreq` — QPC frequency for stopwatch timing.
 - `g_liveTimerID` — Win32 timer ID (100ms tick) driving live stopwatch updates.
-- `CMD_EDIT`/`CMD_DELETE`/`CMD_TOGGLE_TIMER`/`CMD_EDIT_TIMER`/`CMD_BLOCKED` — context menu command IDs.
+- `CMD_EDIT`/`CMD_DELETE`/`CMD_TOGGLE_TIMER`/`CMD_EDIT_TIMER`/`CMD_BLOCKED` — context menu command IDs (`CMD_REPORT`/`CMD_REPORT_PROMPT`/`CMD_UPDATE`/`CMD_AUTO_UPDATE` — global menu command IDs).
 - `MenuItemData` — owner-drawn context menu item struct (label + keyboard hint).
-- `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66) — constants.
+- `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66) — constants. `PROMPT_CLIENT_W` (460), `PROMPT_CLIENT_H` (180), `PROMPT_LIMIT` (4000) — report prompt dialog size/text limits.
 
 ### Data Path (lines 27–39)
 
@@ -114,11 +114,18 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `ParseTimeString(wstring)` — parses `ss`, `m:ss`, or `h:mm:ss` into milliseconds; returns -1 on failure.
 - `AskForTime(HWND, int cardIndex)` — shows the manual time entry dialog, pre-populated with current total time. On accept, sets the card's `timerAccumulated` and resets `sessionAccumulated` (so the run countup starts fresh); timer ends stopped.
 
+### Report Prompt Dialog
+
+- `PromptState` — tracks the free-form report dialog state.
+- `PromptInputProc()` — window procedure for the "Report with your own words" dialog (its own class, `PROMPT_CLASS`). Mirrors the other dialogs: WM_CREATE builds a hint label, a `ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN` edit capped at `PROMPT_LIMIT` (4000) chars, and owner-drawn **Submit**/**Cancel** buttons; WM_DRAWITEM paints them. Submit is deliberately *not* `BS_DEFPUSHBUTTON` so Enter inserts a newline instead of submitting.
+- `AskForReportPrompt(HWND owner, wstring& out)` — modal loop (owner disabled, `AdjustWindowRectEx`-sized to a 460x180 client area); returns true only when the user submits non-blank text.
+- `Trim(wstring)` — shared leading/trailing whitespace trim used for the title and the blank check.
+
 ### Main Window Procedure (lines ~560–790)
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — Ctrl+N triggers AddCard. Hover-based actions on the card under `g_lastMouse`: **Space** (edit), **Delete / D** (delete), **S** (toggle stopwatch), **T** (edit timer), **B** (toggle blocked).
+- **WM_KEYDOWN** — Ctrl+N triggers AddCard. **Ctrl+R** opens the structured bug report, **Ctrl+Shift+R** the free-form prompt, **Ctrl+U** the update check. Hover-based actions on the card under `g_lastMouse`: **Space** (edit), **Delete / D** (delete), **S** (toggle stopwatch), **T** (edit timer), **B** (toggle blocked).
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
 - **WM_LBUTTONUP** — drops card into whichever column the mouse is over.
@@ -136,7 +143,7 @@ Handles all main board interactions:
 
 ### Entry Point (lines ~790–830)
 
-- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input), loads cards, creates main window (920×520), enables dark title bar, runs message loop.
+- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt), loads cards, creates main window (920×520), enables dark title bar, runs message loop.
 
 ### Networking & Self-Updates (GitHub integration)
 
@@ -146,9 +153,10 @@ All network use is on-demand — there are no threads, timers, or persistent con
 - `UrlEncode(wstring)` — UTF-8-aware percent-encoding for URL query strings.
 - `OsVersion()` — real Windows version via dynamically-loaded `RtlGetVersion` (works on Win10/11).
 - `ReportBug(HWND)` — `ShellExecuteW` opens a pre-filled GitHub **new issue** URL (title/body come from a compact pure-`WideCharToMultiByte` encoder; user's browser does GitHub auth).
+- `ReportBugWithPrompt(HWND)` — same, but the body is the user's own wording captured by the report prompt dialog: title = first line trimmed and capped at 64 chars (fallback `Bug report from app`), body = the full prompt verbatim.
 - `UpdateCheck(HWND)` — hits `api.github.com/.../releases/latest` via `URLDownloadToFileW` (writes to disk, not RAM), compares `tag_name` to the compiled `APP_VERSION` with `VersionCmp` (dotted-numeric), prompts, then downloads the release asset in place.
 - `InstallUpdate(HWND, path)` — spawns a detached, hidden `cmd` that waits ~3s for the process to exit, `move`s the new exe over the running one in `%LOCALAPPDATA%`, and relaunches.
-- Entry points: **right-click empty board space** shows a global owner-drawn menu (**Report a Bug** / **Check for Updates**); **Ctrl+R** and **Ctrl+U** do the same. `CMD_REPORT`/`CMD_UPDATE` are the menu IDs; the global menu reuses the card menu's `WM_MEASUREITEM`/`WM_DRAWITEM` painting.
+- Entry points: **right-click empty board space** shows a global owner-drawn menu (**Report a Bug** / **Report with Prompt...** / **Check for Updates** / update-mode toggle); **Ctrl+R**, **Ctrl+Shift+R** and **Ctrl+U** do the same. `CMD_REPORT`/`CMD_REPORT_PROMPT`/`CMD_UPDATE` are the menu IDs; the global menu reuses the card menu's `WM_MEASUREITEM`/`WM_DRAWITEM` painting.
 
 ## Data Format
 
@@ -181,6 +189,7 @@ All network use is on-demand — there are no threads, timers, or persistent con
 | Set stopwatch time manually | Right-click → Edit Timer | **T** |
 | Add new card | Click "+ Add a card" | **Ctrl+N** |
 | File a bug report (opens browser) | Right-click empty space → Report a Bug | **Ctrl+R** |
+| File a report in your own words (opens browser) | Right-click empty space → Report with Prompt... | **Ctrl+Shift+R** |
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 
 Hover-based keyboard actions use the card under the last known mouse position; they no-op if the cursor isn't over a card.
