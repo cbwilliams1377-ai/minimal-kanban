@@ -25,22 +25,52 @@ class PipelineTests(unittest.TestCase):
                         GITHUB_REPO='repo', GITHUB_TOKEN='test-only', GITHUB_BRANCH='master',
                         TEST_API=str(self.api), PATH=f'{self.bin}:{os.environ["PATH"]}')
         self.write(self.bin / 'gh', '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 p=Path(os.environ['TEST_API']); d=json.loads(p.read_text()); a=sys.argv[1:]
 def save(): p.write_text(json.dumps(d))
+def post_fields(a):
+    f={}
+    i=1
+    while i < len(a):
+        t=a[i]
+        if t in ('-f','-F') and i+1 < len(a) and '=' in a[i+1]:
+            k,v=a[i+1].split('=',1)
+            if t=='-F':
+                try: v=json.loads(v)
+                except Exception: pass
+            f[k]=v; i+=2
+        elif t in ('-f','-F') and i+2 < len(a):
+            k=a[i+1]; v=a[i+2]
+            if t=='-F':
+                try: v=json.loads(v)
+                except Exception: pass
+            f[k]=v; i+=3
+        else:
+            i+=1
+    return f
+def endpoint(a):
+    return next((x for x in a[1:] if x.startswith('repos/')), None)
 if a[0]=='api':
-    url=a[-1]
-    if '/issues?' in url: print(json.dumps(d['issues']))
+    url=endpoint(a)
+    m=re.search(r'/releases/(\\d+)$', url)
+    if '--method' in a and 'POST' in a and url.endswith('/releases'):
+        f=post_fields(a)
+        rel={'id': d.get('next_id', 1000), 'tag_name': f.get('tag_name'), 'target_commitish': f.get('target_commitish'), 'draft': bool(f.get('draft')), 'prerelease': False, 'assets': []}
+        d['next_id']=rel['id']+1; d['post_created']=True; d['releases'].insert(0, rel); save(); print(json.dumps(rel))
+    elif m:
+        rid=int(m.group(1)); rel=next(x for x in d['releases'] if x.get('id')==rid)
+        print(json.dumps(rel))
+    elif '/issues?' in url: print(json.dumps(d['issues']))
     elif '/releases/tags/' in url: print(json.dumps(d['releases'][0]))
+    elif 'releases?per_page' in url and d.get('post_created') and os.environ.get('FAIL_LIST_LAG'):
+        print('[]')
     else: print(json.dumps(d['releases']))
 elif a[:2]==['issue','view']:
     if 'state,comments' in a: print(json.dumps({'state':'OPEN','comments':d['comments']}))
     else: print('CLOSED' if a[2] in d['closed'] else 'OPEN')
 elif a[:2]==['issue','close']: d['closed'].append(a[2]); save()
 elif a[:2]==['issue','comment']: d['notes'].append(a[2]); save()
-elif a[:2]==['release','create']:
-    d['releases']=[{'tag_name':a[2], 'target_commitish':a[a.index('--target')+1], 'draft':True, 'prerelease':False, 'assets':[]}]; save()
 elif a[:2]==['release','upload']:
     if os.environ.get('FAIL_UPLOAD'): sys.exit(4)
     d['releases'][0]['assets']=[{'name':'MinimalKanban.exe','size':8}]; save()
@@ -84,7 +114,8 @@ mv reports/queue/*.md reports/done/
         return d
 
     def issue(self, n):
-        return dict(number=n, title=f'Bug {n}', body='Repro', created_at='2026-01-01T00:00:00Z')
+        return dict(number=n, title=f'Bug {n}', body='Repro', created_at='2026-01-01T00:00:00Z',
+                    user={'login': 'owner'})
 
     def run_script(self, script='run-daily.sh', **env):
         return subprocess.run(['bash', str(self.work / 'server' / script)], cwd=self.work,
@@ -119,6 +150,15 @@ mv reports/queue/*.md reports/done/
         self.assertTrue(self.data()['releases'][0]['draft'])
         r = self.run_script()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.data()['closed'], ['1'])
+
+    def test_draft_publish_succeeds_despite_list_endpoint_lag(self):
+        # Regression: the releases list endpoint can lag a freshly created draft
+        # (and a draft has no git tag), so verification must use point reads by id.
+        self.data(issues=[self.issue(1)])
+        r = self.run_script(FAIL_LIST_LAG='1')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.data()['releases'][0]['draft'])
         self.assertEqual(self.data()['closed'], ['1'])
 
     def test_push_failure_does_not_release(self):
@@ -180,6 +220,14 @@ mv reports/queue/*.md reports/done/
         files = list((self.work / 'reports/queue').glob('*.md'))
         self.assertEqual(len(files), 1)
         self.assertIn('-#1-', files[0].name)
+
+    def test_foreign_author_issues_are_ignored(self):
+        self.data(issues=[self.issue(1), dict(self.issue(2), user={'login': 'stranger'})])
+        r = self.run_script('sync_issues.sh')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        queued = list((self.work / 'reports/queue').glob('*.md'))
+        self.assertEqual(len(queued), 1)
+        self.assertIn('-#1-', queued[0].name)
 
 
 if __name__ == '__main__':

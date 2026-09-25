@@ -31,7 +31,9 @@ if [[ ! -f "$PENDING" ]]; then
     report="${queue[0]##*/}"
     base="$(git rev-parse HEAD)"
     save "$(jq -n --arg base "$base" --arg report "$report" '{phase:"agent",base:$base,report:$report}')"
-    bash .bugbot/run_bugbot.sh
+    # The agent must never need or see the repo token; strip it so an injected
+    # prompt cannot exfiltrate credentials. The runner re-exports as required.
+    env -u GH_TOKEN -u GITHUB_TOKEN bash .bugbot/run_bugbot.sh
     clean
     [[ "$(git branch --show-current)" == "$GITHUB_BRANCH" ]] || fail 'Agent changed branches'
     if [[ ! -f "reports/done/$report" ]]; then
@@ -72,19 +74,24 @@ release="$(jq -sc --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | .[0] /
 if [[ -z "$release" ]]; then
     # Refuse pre-existing tags: they could point at an unrelated commit.
     [[ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ]] || fail 'Release tag already exists; inspect before proceeding'
-    gh release create "$tag" --repo "$REPO" --target "$sha" --draft \
-        --title "Minimal Kanban ${tag#v}" --notes 'Automated build from BugBot run.'
-    # A draft has no git tag yet, so lookup via the list endpoint, not tags/<tag>.
-    release="$(gh api --paginate "repos/$REPO/releases?per_page=100" \
-        | jq -sc --arg tag "$tag" '[.[][] | select(.tag_name == $tag)] | .[0] // empty')"
-    [[ -n "$release" ]] || fail 'Draft release not visible after create; inspect before proceeding'
+    # POST returns the created release (with id) immediately; the list and
+    # tags/<tag> endpoints are cache- and tag-ref-based and can lag a fresh
+    # draft, so all verification reads happen by release id.
+    release="$(gh api --method POST "repos/$REPO/releases" \
+        -f tag_name="$tag" -f target_commitish="$sha" \
+        -f name="Minimal Kanban ${tag#v}" \
+        -f body='Automated build from BugBot run.' -F draft=true)" \
+        || fail 'Release create failed; inspect before proceeding'
 fi
+release_id="$(jq -r .id <<<"$release")"
+[[ "$release_id" =~ ^[0-9]+$ ]] || fail 'Could not determine release ID; inspect before proceeding'
+release="$(gh api "repos/$REPO/releases/$release_id")"
 [[ "$(jq -r .target_commitish <<<"$release")" == "$sha" ]] || fail 'Release target differs from pending commit'
 if [[ "$(jq -r .draft <<<"$release")" == true ]]; then
-    gh release upload "$tag" MinimalKanban.exe --repo "$REPO" --clobber
-    gh release edit "$tag" --repo "$REPO" --draft=false --latest
+    gh release upload "$release_id" MinimalKanban.exe --repo "$REPO" --clobber
+    gh release edit "$release_id" --repo "$REPO" --draft=false --latest
 fi
-release="$(gh api "repos/$REPO/releases/tags/$tag")"
+release="$(gh api "repos/$REPO/releases/$release_id")"
 jq -e '.draft == false and .prerelease == false and any(.assets[]; .name == "MinimalKanban.exe" and .size > 0)' <<<"$release" >/dev/null || fail 'Published executable missing'
 # Only the report associated with this successfully published transaction closes.
 if [[ "$report" =~ -#([0-9]+)- ]]; then

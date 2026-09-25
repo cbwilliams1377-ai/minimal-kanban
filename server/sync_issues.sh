@@ -4,6 +4,7 @@ set -euo pipefail
 export GH_TOKEN="${GITHUB_TOKEN:?}"
 REPO="$GITHUB_OWNER/$GITHUB_REPO"
 OWNER="${BUGBOT_OWNER:-$GITHUB_OWNER}"
+ALLOWED="${BUGBOT_ALLOWED_AUTHORS:-$OWNER}"
 QUEUE="$WORKSPACE/reports/queue"
 BLOCKED="$WORKSPACE/reports/blocked"
 DONE="$WORKSPACE/reports/done"
@@ -39,6 +40,12 @@ done
 # Paginate instead of silently dropping issues after the first 100.
 issues="$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100")"
 while IFS= read -r iss; do
+    # Prompt-injection guard: only import issues opened by approved accounts.
+    author="$(jq -r .user.login <<<"$iss")"
+    case ",$ALLOWED," in
+        *",$author,"*) ;;
+        *) continue ;;
+    esac
     num="$(jq -r .number <<<"$iss")"
     matches=("$QUEUE"/*-"#$num"-*.md "$BLOCKED"/*-"#$num"-*.md "$DONE"/*-"#$num"-*.md)
     (( ${#matches[@]} == 0 )) || continue

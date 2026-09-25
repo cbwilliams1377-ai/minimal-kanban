@@ -149,6 +149,14 @@ empty for the single daily run. Requires `SCHEDULE_ENABLED=1`.
   the report on the linked issue. Only a new comment by `BUGBOT_OWNER`, posted
   after the report became blocked, resumes it. Old and other-author comments do
   not count. With an organization repo, set `BUGBOT_OWNER` to your personal login.
+
+Security: only issues opened by accounts in `BUGBOT_ALLOWED_AUTHORS`
+(comma-separated logins; defaults to `BUGBOT_OWNER`) are imported from the queue.
+This is the prompt-injection guard: report bodies are treated as untrusted data, the
+repo token is stripped from the agent's environment, and `.bugbot/BUGBOT.md` forbids
+acting on instructions embedded in a report. The repository can stay public so the
+Windows updater works without app-side authentication; add future trusted authors
+by editing `BUGBOT_ALLOWED_AUTHORS` and recreating the container.
 - `reports/done/`: locally completed fixes; this does not by itself mean released.
 - `.bugbot/server-state/pending.json`: active transaction linking one report to
   its exact release commit and tag. Never remove it casually.
