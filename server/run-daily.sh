@@ -85,11 +85,14 @@ if [[ -z "$release" ]]; then
 fi
 release_id="$(jq -r .id <<<"$release")"
 [[ "$release_id" =~ ^[0-9]+$ ]] || fail 'Could not determine release ID; inspect before proceeding'
+# Verification reads go through the REST API by release id (point-consistent).
+# gh's release subcommands do not resolve numeric ids in this version, but tag
+# name resolves even for drafts -- so upload/edit use the tag.
 release="$(gh api "repos/$REPO/releases/$release_id")"
 [[ "$(jq -r .target_commitish <<<"$release")" == "$sha" ]] || fail 'Release target differs from pending commit'
 if [[ "$(jq -r .draft <<<"$release")" == true ]]; then
-    gh release upload "$release_id" MinimalKanban.exe --repo "$REPO" --clobber
-    gh release edit "$release_id" --repo "$REPO" --draft=false --latest
+    gh release upload "$tag" MinimalKanban.exe --repo "$REPO" --clobber
+    gh release edit "$tag" --repo "$REPO" --draft=false --latest
 fi
 release="$(gh api "repos/$REPO/releases/$release_id")"
 jq -e '.draft == false and .prerelease == false and any(.assets[]; .name == "MinimalKanban.exe" and .size > 0)' <<<"$release" >/dev/null || fail 'Published executable missing'
