@@ -88,7 +88,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Card Action Helpers (lines ~540–558)
 
-- `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value.
+- `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time).
 - `ToggleBlocked(HWND, index)` — shared blocked-flag toggle (used by Ctrl+click, `B` key, and menu).
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
 
@@ -99,6 +99,13 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `AddRect(RECT col)` — the "Add a card" clickable area at the bottom of column 0.
 - `SetDarkTitleBar(HWND)` — dynamically loads `dwmapi.dll` to enable dark title bar (DWMWA_USE_IMMERSIVE_DARK_MODE). Graceful fallback on older Windows.
 - `CardRects(RECT client)` — returns all card screen rectangles (60px height, 66px spacing). Each card fits 10px inset from column edges.
+
+### Shared Dialog Helpers (lines ~375–428)
+
+- `EditText(HWND edit)` — reads an edit control's contents into a `std::wstring`.
+- `IsWordSeparator(wchar_t)` — whitespace test used when walking back a word.
+- `DeleteWordBack(HWND edit)` — implements **Ctrl+Backspace** (delete the word, and any whitespace before it, in front of the caret) by selecting the range and clearing it. Windows' edit control never receives that combination through `IsDialogMessage`, so the dialogs run it themselves.
+- `PumpDialog(HWND dlg, HWND edit, bool* done, bool ctrlEnterSubmits)` — the one modal message loop all three dialogs use. It forwards the **Ctrl+Backspace** above when the text box has focus, and, when `ctrlEnterSubmits` is set, turns **Ctrl+Enter** into the dialog's IDOK (used by the report prompt's Submit).
 
 ### Add-Card Dialog (lines 278–395)
 
@@ -117,7 +124,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 ### Report Prompt Dialog
 
 - `PromptState` — tracks the free-form report dialog state.
-- `PromptInputProc()` — window procedure for the "Report with your own words" dialog (its own class, `PROMPT_CLASS`). Mirrors the other dialogs: WM_CREATE builds a hint label, a `ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN` edit capped at `PROMPT_LIMIT` (4000) chars, and owner-drawn **Submit**/**Cancel** buttons; WM_DRAWITEM paints them. Submit is deliberately *not* `BS_DEFPUSHBUTTON` so Enter inserts a newline instead of submitting.
+- `PromptInputProc()` — window procedure for the "Report with your own words" dialog (its own class, `PROMPT_CLASS`). Mirrors the other dialogs: WM_CREATE builds a hint label, a `ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN` edit capped at `PROMPT_LIMIT` (4000) chars, and owner-drawn **Submit**/**Cancel** buttons; WM_DRAWITEM paints them. Submit is deliberately *not* `BS_DEFPUSHBUTTON` so Enter inserts a newline instead of submitting — **Ctrl+Enter** is the submit shortcut instead (handled by `PumpDialog`).
 - `AskForReportPrompt(HWND owner, wstring& out)` — modal loop (owner disabled, `AdjustWindowRectEx`-sized to a 460x180 client area); returns true only when the user submits non-blank text.
 - `Trim(wstring)` — shared leading/trailing whitespace trim used for the title and the blank check.
 
@@ -182,7 +189,7 @@ All network use is on-demand — there are no threads, timers, or persistent con
 | Action | Mouse | Keyboard (hover over card) |
 |--------|-------|----------------------------|
 | Move card between columns | Drag (plain click) | — (mouse-only) |
-| Toggle stopwatch start/stop | Shift+left-click | **S** |
+| Toggle stopwatch start/stop (starts a running stopwatch on the other card) | Shift+left-click | **S** |
 | Toggle blocked flag (red outline) | Ctrl+left-click | **B** |
 | Edit card text | Right-click → Edit | **Space** |
 | Delete card | Right-click → Delete | **Delete** or **D** |
@@ -193,6 +200,17 @@ All network use is on-demand — there are no threads, timers, or persistent con
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 
 Hover-based keyboard actions use the card under the last known mouse position; they no-op if the cursor isn't over a card.
+
+## Dialog Interactions
+
+All three dialogs (add/edit card, set timer, report prompt) share one modal loop, so they share these
+shortcuts:
+
+| Action | Keyboard |
+|--------|----------|
+| Delete the previous word in the text box | **Ctrl+Backspace** |
+| Submit the "Report with your own words" dialog (Enter inserts a newline there) | **Ctrl+Enter** |
+| Accept / dismiss the add-card and set-timer dialogs | **Enter** / **Esc** |
 
 ## Conventions
 

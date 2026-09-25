@@ -372,6 +372,64 @@ static std::vector<std::pair<int, RECT>> CardRects(const RECT& client) {
     return result;
 }
 
+// Read the whole contents of an edit control.
+static std::wstring EditText(HWND edit) {
+    int n = GetWindowTextLengthW(edit);
+    std::wstring text(n + 1, L'\0');
+    GetWindowTextW(edit, text.data(), n + 1);
+    text.resize(n);
+    return text;
+}
+
+// Characters that separate words when walking backwards from the caret.
+static bool IsWordSeparator(wchar_t ch) {
+    return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n';
+}
+
+// Delete the word in front of the caret (Ctrl+Backspace). With no selection the
+// word plus the whitespace before it is removed and the caret lands where the
+// word started; with a selection the selection itself is deleted. The dialogs call
+// this from the modal loop because Windows never hands Ctrl+Backspace to their
+// edit boxes.
+static void DeleteWordBack(HWND edit) {
+    if (!edit) return;
+    DWORD from = 0, to = 0;
+    SendMessageW(edit, EM_GETSEL, (WPARAM)&from, (LPARAM)&to);
+    std::wstring text = EditText(edit);
+    size_t start = std::min<size_t>(from, to), end = std::max<size_t>(from, to);
+    start = std::min(start, text.size());
+    end = std::min(end, text.size());
+    if (start == end) {
+        // No selection: step back over any whitespace, then over the word itself.
+        while (start > 0 && IsWordSeparator(text[start - 1])) --start;
+        while (start > 0 && !IsWordSeparator(text[start - 1])) --start;
+    }
+    if (start == end) return;
+    SendMessageW(edit, EM_SETSEL, (WPARAM)start, (LPARAM)end);
+    SendMessageW(edit, EM_REPLACESEL, TRUE, (LPARAM)L"");
+}
+
+// Shared modal loop for the app's dialogs. Besides pumping messages until the
+// dialog closes, it supplies two shortcuts the dialog plumbing swallows:
+// Ctrl+Backspace deletes the previous word in the text box, and dialogs that ask
+// for it (the report prompt) get Ctrl+Enter as a shortcut for the Submit button.
+static void PumpDialog(HWND dlg, HWND edit, bool* done, bool ctrlEnterSubmits) {
+    MSG msg;
+    while (!*done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            if (msg.wParam == VK_BACK && edit && GetFocus() == edit) {
+                DeleteWordBack(edit);
+                continue;
+            }
+            if (ctrlEnterSubmits && msg.wParam == VK_RETURN) {
+                SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), (LPARAM)GetDlgItem(dlg, IDOK));
+                continue;
+            }
+        }
+        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+}
+
 // State used while the add-card window is open.
 // The main window waits until done becomes true, then checks accepted and text.
 struct InputState { HWND edit = nullptr; bool done = false; bool accepted = false; std::wstring text; std::wstring initial; };
@@ -482,10 +540,7 @@ static bool AskForCard(HWND owner, std::wstring& out, const std::wstring& initia
     if (!dlg) { EnableWindow(owner, TRUE); g_input = nullptr; return false; }
     SetDarkTitleBar(dlg);
     // This is a small modal message loop: process dialog messages until it closes.
-    MSG msg;
-    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    }
+    PumpDialog(dlg, state.edit, &state.done, false);
     EnableWindow(owner, TRUE); SetForegroundWindow(owner); g_input = nullptr;
     if (state.accepted) out = state.text;
     return state.accepted;
@@ -601,10 +656,7 @@ static void AskForTime(HWND hwnd, int cardIndex) {
         WS_CAPTION | WS_SYSMENU | WS_VISIBLE, x, y, 376, 140, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!dlg) { EnableWindow(hwnd, TRUE); g_timeInput = nullptr; return; }
     SetDarkTitleBar(dlg);
-    MSG msg;
-    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    }
+    PumpDialog(dlg, state.edit, &state.done, false);
     EnableWindow(hwnd, TRUE); SetForegroundWindow(hwnd);
     if (state.accepted) {
         LONGLONG parsed = ParseTimeString(state.text);
@@ -717,16 +769,17 @@ static bool AskForReportPrompt(HWND owner, std::wstring& out) {
     if (!dlg) { EnableWindow(owner, TRUE); g_prompt = nullptr; return false; }
     SetDarkTitleBar(dlg);
     // Modal message loop: process dialog messages until it closes.
-    MSG msg;
-    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    }
+    // Ctrl+Enter submits, since Enter alone has to insert a newline in the text box.
+    PumpDialog(dlg, state.edit, &state.done, true);
     EnableWindow(owner, TRUE); SetForegroundWindow(owner); g_prompt = nullptr;
     if (state.accepted) out = state.text;
     return state.accepted;
 }
 
 // Toggle the stopwatch for a card: start when stopped, pause when running.
+// Starting while another card is running switches the run over: the previous card
+// is paused first (freezing its in-flight stretch into sessionAccumulated), so
+// exactly one stopwatch runs at a time and it is the one the user just toggled.
 // Pausing freezes the in-flight stretch into sessionAccumulated instead of the
 // accumulated total, so the live countup keeps displaying the value (it only
 // resets when the program closes and the card reloads).
@@ -736,8 +789,13 @@ static void ToggleTimer(HWND hwnd, int index) {
         g_cards[index].timerStart = 0;
         if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     } else {
-        if (AnyTimerRunning()) return;
-        g_cards[index].timerStart = NowMs();
+        LONGLONG now = NowMs();
+        for (size_t i = 0; i < g_cards.size(); ++i) {
+            if (static_cast<int>(i) == index || g_cards[i].timerStart == 0) continue;
+            g_cards[i].sessionAccumulated += (now - g_cards[i].timerStart);
+            g_cards[i].timerStart = 0;
+        }
+        g_cards[index].timerStart = now;
         StartLiveTimer(hwnd);
     }
     SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
