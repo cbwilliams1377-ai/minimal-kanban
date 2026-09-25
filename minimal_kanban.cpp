@@ -44,7 +44,7 @@ static const wchar_t* PROMPT_CLASS = L"MinimalKanbanReportPrompt"; // Name of th
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
-static const wchar_t* APP_VERSION = L"0.1.2";
+static const wchar_t* APP_VERSION = L"0.1.3";
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
 static Settings g_settings;
