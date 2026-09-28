@@ -146,11 +146,18 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `AskForReportPrompt(HWND owner, wstring& out)` — modal loop (owner disabled, `AdjustWindowRectEx`-sized to a 460x180 client area); returns true only when the user submits non-blank text.
 - `Trim(wstring)` — shared leading/trailing whitespace trim used for the title and the blank check.
 
+### F1 Help Page
+
+- `HelpBindingLine(label, action)` — renders one keyboard action and its bindings, e.g. `Delete card: Del, D`.
+- `BuildHelpText()` — assembles the whole help page (columns, card visuals, mouse interactions, every configured shortcut via `HotkeyText`, dialog shortcuts). Generated at F1 time from the *configured* bindings, so a remap or `Reload Hotkeys` is always reflected; nothing is written to disk and the app stays offline. Text lives in the exe, so it can never drift from the binary after a self-update.
+- `HelpProc()` — the help window's procedure (`HELP_CLASS`): a dark, read-only, scrollable multiline EDIT filling the client; `Esc`/`Close` dismiss, `WM_SIZE` re-lays the text. `g_helpHwnd` guards against duplicates; pressing F1 again refreshes the open page with the current bindings.
+- `ShowHelp(HWND)` — opens (or refreshes) the 560×600 help window centered over the board, dark-title-bared. Launched only by **F1**, which is fixed and deliberately not one of the rebindable `HK_*` actions.
+
 ### Main Window Procedure (lines ~560–790)
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — every keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Up/Down** select a card with the blue outline, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
+- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Up/Down** select a card with the blue outline, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
 - **WM_LBUTTONUP** — drops card into whichever column the mouse is over.

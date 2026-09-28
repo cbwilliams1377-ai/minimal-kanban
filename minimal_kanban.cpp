@@ -54,6 +54,7 @@ static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main w
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
 static const wchar_t* PROMPT_CLASS = L"MinimalKanbanReportPrompt"; // Name of the report prompt window class.
+static const wchar_t* HELP_CLASS = L"MinimalKanbanHelp"; // Name of the F1 help window class.
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
@@ -69,6 +70,7 @@ static const wchar_t* HK_NAMES[HK_COUNT] = {
 static std::vector<Hotkey> g_hotkeys[HK_COUNT];
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
+static HWND g_helpHwnd = nullptr;        // Handle of the F1 help window (0 = closed).
 static Settings g_settings;
 static volatile LONG g_updateBusy = 0;
 static volatile LONG g_updateCancelled = 0;
@@ -590,6 +592,132 @@ static void SetDarkTitleBar(HWND hwnd) {
         setAttribute(hwnd, 20, &enabled, sizeof(enabled));
     }
     FreeLibrary(dwm);
+}
+
+// F1 help window. The help text is generated at open time from the *configured*
+// hotkey bindings (via HotkeyText), so after editing hotkeys.json and choosing
+// "Reload Hotkeys" the page always shows the current shortcuts. Nothing is
+// written to disk; the app keeps working offline.
+
+// Describe one keyboard action with its bindings, e.g. "Delete card: Del, D".
+static std::wstring HelpBindingLine(const wchar_t* label, int action) {
+    std::wstring out(label);
+    out += L": ";
+    for (size_t i = 0; i < g_hotkeys[action].size(); ++i) {
+        if (i) out += L", ";
+        out += HotkeyText(g_hotkeys[action][i]);
+    }
+    return out;
+}
+
+// Assemble the entire help page: columns, card visuals, mouse interactions, the
+// keyboard actions (each with its live bindings) and the dialog shortcuts.
+static std::wstring BuildHelpText() {
+    std::wstring t;
+    t += L"Minimal Kanban - Help (v" + std::wstring(APP_VERSION) + L")\r\n";
+    t += L"\r\n";
+    t += L"The board has three columns:\r\n";
+    t += L"  Todo - tasks not started yet\r\n";
+    t += L"  In-Progress - tasks being worked on now\r\n";
+    t += L"  Complete - finished tasks\r\n";
+    t += L"\r\n";
+    t += L"Cards:\r\n";
+    t += L"  Task text - the card's description\r\n";
+    t += L"  Gray time - the total stopwatch time\r\n";
+    t += L"  Green +time - the current stopwatch countup (running or paused)\r\n";
+    t += L"  Red outline - the card is blocked\r\n";
+    t += L"  Green outline - the stopwatch is running on this card\r\n";
+    t += L"  Blue outline - the card is selected with the arrow keys\r\n";
+    t += L"\r\n";
+    t += L"Mouse:\r\n";
+    t += L"  Click \"+ Add a card\" - add a task to the Todo column\r\n";
+    t += L"  Drag a card - move it to another column\r\n";
+    t += L"  Shift+click a card - start/stop its stopwatch\r\n";
+    t += L"  Ctrl+click a card - toggle its blocked flag\r\n";
+    t += L"  Right-click a card - edit, delete or set its timer\r\n";
+    t += L"  Right-click empty board space - reports, updates, reload hotkeys\r\n";
+    t += L"\r\n";
+    t += L"Keyboard (F1 stays fixed and is not rebindable):\r\n";
+    t += L"  F1 - show this help page\r\n";
+    t += HelpBindingLine(L"  Add a new card", HK_ADD) + L"\r\n";
+    t += HelpBindingLine(L"  Edit card text", HK_EDIT) + L"\r\n";
+    t += HelpBindingLine(L"  Delete card", HK_DELETE) + L"\r\n";
+    t += HelpBindingLine(L"  Toggle stopwatch", HK_TOGGLE_TIMER) + L"\r\n";
+    t += HelpBindingLine(L"  Set stopwatch time manually", HK_EDIT_TIMER) + L"\r\n";
+    t += HelpBindingLine(L"  Toggle blocked flag", HK_BLOCKED) + L"\r\n";
+    t += HelpBindingLine(L"  Select previous card", HK_SELECT_UP) + L"\r\n";
+    t += HelpBindingLine(L"  Select next card", HK_SELECT_DOWN) + L"\r\n";
+    t += HelpBindingLine(L"  Move card to the previous column", HK_MOVE_LEFT) + L"\r\n";
+    t += HelpBindingLine(L"  Move card to the next column", HK_MOVE_RIGHT) + L"\r\n";
+    t += HelpBindingLine(L"  File a bug report", HK_REPORT) + L"\r\n";
+    t += HelpBindingLine(L"  File a report in your own words", HK_REPORT_PROMPT) + L"\r\n";
+    t += HelpBindingLine(L"  Check for updates", HK_UPDATE) + L"\r\n";
+    t += L"\r\n";
+    t += L"Keyboard card actions apply to the card under the mouse, falling back\r\n";
+    t += L"to the selected card when the pointer is not over one.\r\n";
+    t += L"\r\n";
+    t += L"Dialogs:\r\n";
+    t += L"  Enter / Esc - accept or dismiss the add-card and set-timer dialogs\r\n";
+    t += L"  Ctrl+Backspace - delete the previous word in a text box\r\n";
+    t += L"  Ctrl+Enter - submit the \"Report with your own words\" dialog\r\n";
+    t += L"\r\n";
+    t += L"The shortcuts above are configured in hotkeys.json next to the app.\r\n";
+    t += L"Edit that file and choose \"Reload Hotkeys\" (right-click empty board\r\n";
+    t += L"space) to apply the changes without restarting. This page always shows\r\n";
+    t += L"the configured shortcuts.\r\n";
+    return t;
+}
+
+// Window procedure for the help window: a dark, scrollable, read-only text view.
+static LRESULT CALLBACK HelpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        // A read-only multiline EDIT control fills the client area and scrolls.
+        CREATESTRUCT* cs = (CREATESTRUCT*)lp;
+        RECT client{}; GetClientRect(hwnd, &client);
+        HWND edit = CreateWindowW(L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            0, 0, client.right, client.bottom, hwnd, (HMENU)100, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(edit, WM_SETFONT, (WPARAM)g_font, TRUE);
+        if (cs->lpCreateParams) SetWindowTextW(edit, ((std::wstring*)cs->lpCreateParams)->c_str());
+        SetFocus(edit);
+        return 0;
+    }
+    case WM_ERASEBKGND: { RECT client{}; GetClientRect(hwnd, &client); Fill((HDC)wp, client, RGB(32,32,32)); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp; SetTextColor(dc, RGB(225,225,225)); SetBkColor(dc, RGB(32,32,32));
+        static HBRUSH brush = CreateSolidBrush(RGB(32,32,32)); return (LRESULT)brush;
+    }
+    case WM_SIZE: {
+        HWND edit = GetDlgItem(hwnd, 100);
+        if (edit) MoveWindow(edit, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_helpHwnd = nullptr; return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Open (or refresh) the F1 help window. Rebuilding the text each time keeps the
+// page truthful after hotkeys.json is edited and reloaded.
+static void ShowHelp(HWND owner) {
+    std::wstring text = BuildHelpText();
+    if (g_helpHwnd && IsWindow(g_helpHwnd)) {
+        HWND edit = GetDlgItem(g_helpHwnd, 100);
+        if (edit) SetWindowTextW(edit, text.c_str());
+        SetForegroundWindow(g_helpHwnd);
+        return;
+    }
+    RECT pr{}; GetWindowRect(owner, &pr);
+    int x = pr.left + (pr.right - pr.left - 560) / 2;
+    int y = pr.top + (pr.bottom - pr.top - 600) / 2;
+    g_helpHwnd = CreateWindowExW(WS_EX_APPWINDOW, HELP_CLASS, L"Minimal Kanban - Help",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, 560, 600, owner, nullptr, GetModuleHandleW(nullptr), &text);
+    if (g_helpHwnd) SetDarkTitleBar(g_helpHwnd);
 }
 
 // Return the rectangles of all cards that fit inside their columns.
@@ -1370,6 +1498,10 @@ static void UpdateCheck(HWND hwnd) {
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 case WM_KEYDOWN: {
+        // F1 is a fixed key (never rebindable): it opens the help page, showing
+        // the currently configured shortcuts. Handled before the configurable
+        // dispatch so it always wins.
+        if (wp == VK_F1) { ShowHelp(hwnd); return 0; }
         // Every keyboard action is routed through the bindings loaded from
         // hotkeys.json, so rebinding one action changes the whole board at once.
         // The arrow-key selection, the report/update actions and the card
@@ -1724,6 +1856,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     promptClass.lpfnWndProc = PromptInputProc; promptClass.hInstance = instance; promptClass.lpszClassName = PROMPT_CLASS;
     promptClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); promptClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassExW(&promptClass);
+    // Register the F1 help window class.
+    WNDCLASSEXW helpClass{sizeof(helpClass)};
+    helpClass.lpfnWndProc = HelpProc; helpClass.hInstance = instance; helpClass.lpszClassName = HELP_CLASS;
+    helpClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); helpClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassExW(&helpClass);
     LoadCards(); // Restore the previous board before showing the window.
     LoadSettings();
     LoadHotkeys();
