@@ -31,6 +31,18 @@ struct Settings {
     bool checkOnStartup = true;
 };
 
+// The board actions that hotkeys.json can rebind, in the order they are listed
+// in the generated file. An action holds one or more bindings; a key press
+// matches an action when modifiers and virtual key are all identical.
+enum {
+    HK_ADD = 0, HK_EDIT, HK_DELETE, HK_TOGGLE_TIMER, HK_EDIT_TIMER, HK_BLOCKED,
+    HK_SELECT_UP, HK_SELECT_DOWN, HK_MOVE_LEFT, HK_MOVE_RIGHT,
+    HK_REPORT, HK_REPORT_PROMPT, HK_UPDATE, HK_COUNT
+};
+
+// One keyboard shortcut: modifier flags (MOD_*) plus a virtual-key code.
+struct Hotkey { UINT mods = 0; UINT vk = 0; };
+
 // These global variables hold the board and the pieces of UI state shared by message handlers.
 static std::vector<Card> g_cards; // All cards currently loaded in memory.
 static HFONT g_font = nullptr, g_boldFont = nullptr; // Fonts used while drawing text.
@@ -46,6 +58,15 @@ static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
 static const wchar_t* APP_VERSION = L"0.1.5";
+// Names of the rebindable actions, used both as hotkeys.json keys and when
+// matching a pressed key back to its action.
+static const wchar_t* HK_NAMES[HK_COUNT] = {
+    L"add", L"edit", L"delete", L"toggle_timer", L"edit_timer", L"blocked",
+    L"select_up", L"select_down", L"move_left", L"move_right",
+    L"report", L"report_prompt", L"update"
+};
+// The current binding set, loaded from hotkeys.json at startup or on "Reload Hotkeys".
+static std::vector<Hotkey> g_hotkeys[HK_COUNT];
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
 static Settings g_settings;
@@ -68,6 +89,7 @@ static volatile LONG g_updateCancelled = 0;
 #define CMD_UPDATE 7
 #define CMD_AUTO_UPDATE 8
 #define CMD_REPORT_PROMPT 9
+#define CMD_RELOAD_HOTKEYS 10
 
 // Size limits for the natural-language report prompt dialog.
 #define PROMPT_CLIENT_W 460 // Dialog client width in pixels.
@@ -94,6 +116,8 @@ static std::wstring AppLocalDir() {
 static std::wstring DataPath() { return AppLocalDir() + L"\\board.json"; }
 
 static std::wstring SettingsPath() { return AppLocalDir() + L"\\settings.json"; }
+
+static std::wstring HotkeysPath() { return AppLocalDir() + L"\\hotkeys.json"; }
 
 // Convert Windows' UTF-16 string type to UTF-8 for the JSON file.
 static std::string Utf8(const std::wstring& s) {
@@ -322,6 +346,216 @@ static void SaveSettings() {
     if (!f) return;
     f << "{\n  \"update_mode\": \"" << (g_settings.autoUpdate ? "auto" : "ask") << "\""
       << ",\n  \"check_on_startup\": " << (g_settings.checkOnStartup ? "true" : "false") << "\n}\n";
+}
+
+// Hotkeys: an editable config file that rebinds the board's keyboard shortcuts.
+
+// Restore the shipped shortcut set. delete keeps both Del and D so the keys the
+// app has always documented keep working until the user changes them.
+static void ResetHotkeysToDefaults() {
+    g_hotkeys[HK_ADD]           = { { MOD_CONTROL, 'N' } };
+    g_hotkeys[HK_EDIT]          = { { 0, VK_SPACE } };
+    g_hotkeys[HK_DELETE]        = { { 0, VK_DELETE }, { 0, 'D' } };
+    g_hotkeys[HK_TOGGLE_TIMER]  = { { 0, 'S' } };
+    g_hotkeys[HK_EDIT_TIMER]    = { { 0, 'T' } };
+    g_hotkeys[HK_BLOCKED]       = { { 0, 'B' } };
+    g_hotkeys[HK_SELECT_UP]     = { { 0, VK_UP } };
+    g_hotkeys[HK_SELECT_DOWN]   = { { 0, VK_DOWN } };
+    g_hotkeys[HK_MOVE_LEFT]     = { { 0, VK_LEFT } };
+    g_hotkeys[HK_MOVE_RIGHT]    = { { 0, VK_RIGHT } };
+    g_hotkeys[HK_REPORT]        = { { MOD_CONTROL, 'R' } };
+    g_hotkeys[HK_REPORT_PROMPT] = { { MOD_CONTROL | MOD_SHIFT, 'R' } };
+    g_hotkeys[HK_UPDATE]        = { { MOD_CONTROL, 'U' } };
+}
+
+// Turn one key name (as written in hotkeys.json) into a virtual-key code.
+// Returns 0 when the name is not a key this build can bind.
+static UINT HotkeyKeyFromName(const std::wstring& upper) {
+    static const struct { const wchar_t* name; UINT vk; } named[] = {
+        { L"SPACE", VK_SPACE }, { L"ENTER", VK_RETURN }, { L"RETURN", VK_RETURN },
+        { L"TAB", VK_TAB }, { L"ESC", VK_ESCAPE }, { L"ESCAPE", VK_ESCAPE },
+        { L"BACK", VK_BACK }, { L"BACKSPACE", VK_BACK }, { L"DEL", VK_DELETE },
+        { L"DELETE", VK_DELETE }, { L"INS", VK_INSERT }, { L"INSERT", VK_INSERT },
+        { L"UP", VK_UP }, { L"DOWN", VK_DOWN }, { L"LEFT", VK_LEFT }, { L"RIGHT", VK_RIGHT },
+        { L"HOME", VK_HOME }, { L"END", VK_END }, { L"PGUP", VK_PRIOR }, { L"PGDN", VK_NEXT },
+        { L"PRTSC", VK_SNAPSHOT }, { L"PAUSE", VK_PAUSE },
+    };
+    for (const auto& n : named) if (upper == n.name) return n.vk;
+    if (upper.size() > 1 && upper[0] == L'F' && std::all_of(upper.begin() + 1, upper.end(),
+        [](wchar_t c) { return c >= L'0' && c <= L'9'; })) {
+        int n = _wtoi(upper.c_str());
+        if (n >= 1 && n <= 12) return (UINT)(VK_F1 + n - 1);
+    }
+    if (upper.size() == 1) {
+        wchar_t ch = upper[0];
+        if (ch >= L'A' && ch <= L'Z') return (UINT)ch;
+        if (ch >= L'0' && ch <= L'9') return (UINT)ch;
+        SHORT scan = VkKeyScanW(ch); // Other printable characters (e.g. ",", "/").
+        if (scan != -1) return (UINT)(scan & 0xFF);
+    }
+    return 0;
+}
+
+// Render a virtual-key code the way hotkeys.json spells it (the inverse of
+// HotkeyKeyFromName; used when writing the file and for on-screen hints).
+static std::wstring HotkeyKeyName(UINT vk) {
+    if (vk >= 'A' && vk <= 'Z') return std::wstring(1, (wchar_t)vk);
+    if (vk >= '0' && vk <= '9') return std::wstring(1, (wchar_t)vk);
+    static const struct { UINT vk; const wchar_t* name; } named[] = {
+        { VK_SPACE, L"Space" }, { VK_RETURN, L"Enter" }, { VK_TAB, L"Tab" },
+        { VK_ESCAPE, L"Esc" }, { VK_BACK, L"Back" }, { VK_DELETE, L"Del" },
+        { VK_INSERT, L"Ins" }, { VK_UP, L"Up" }, { VK_DOWN, L"Down" },
+        { VK_LEFT, L"Left" }, { VK_RIGHT, L"Right" }, { VK_HOME, L"Home" },
+        { VK_END, L"End" }, { VK_PRIOR, L"PgUp" }, { VK_NEXT, L"PgDn" },
+        { VK_SNAPSHOT, L"PrtSc" }, { VK_PAUSE, L"Pause" },
+    };
+    for (const auto& n : named) if (n.vk == vk) return n.name;
+    if (vk >= VK_F1 && vk <= VK_F12) return L"F" + std::to_wstring((int)(vk - VK_F1 + 1));
+    wchar_t ch = (wchar_t)MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR); // Any other printable key.
+    return ch ? std::wstring(1, ch) : L"?";
+}
+
+// Render one binding with "+"-joined modifiers, e.g. "Ctrl+Shift+R".
+static std::wstring HotkeyText(const Hotkey& h) {
+    std::wstring out;
+    if (h.mods & MOD_CONTROL) out += L"Ctrl+";
+    if (h.mods & MOD_SHIFT) out += L"Shift+";
+    if (h.mods & MOD_ALT) out += L"Alt+";
+    if (h.mods & MOD_WIN) out += L"Win+";
+    return out + HotkeyKeyName(h.vk);
+}
+
+// Parse a "Ctrl+Shift+R" style binding; modifiers and key names are case-insensitive.
+static bool HotkeyFromText(const std::wstring& text, Hotkey& out) {
+    Hotkey h;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t plus = text.find(L'+', start);
+        std::wstring part = text.substr(start, plus == std::wstring::npos ? std::wstring::npos : plus - start);
+        std::wstring upper = part;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](wchar_t c) { return (wchar_t)towupper(c); });
+        if (plus == std::wstring::npos) {
+            if (h.vk) return false;                       // Two key parts, no "+" left.
+            h.vk = HotkeyKeyFromName(upper);
+            if (!h.vk) return false;                      // Unknown key name.
+            break;
+        }
+        if (upper == L"CTRL" || upper == L"CONTROL") h.mods |= MOD_CONTROL;
+        else if (upper == L"SHIFT") h.mods |= MOD_SHIFT;
+        else if (upper == L"ALT") h.mods |= MOD_ALT;
+        else if (upper == L"WIN" || upper == L"CMD") h.mods |= MOD_WIN;
+        else return false;
+        start = plus + 1;
+    }
+    if (start >= text.size()) return false;               // Trailing "+".
+    out = h;
+    return true;
+}
+
+// Extract the JSON value that follows a "key": match and hand back the raw value:
+// strings are unquoted, arrays keep their brackets so the caller can split them.
+static std::string JsonValueField(const std::string& json, const char* key) {
+    std::string quoted = std::string("\"") + key + "\"";
+    size_t p = json.find(quoted);
+    if (p == std::string::npos) return {};
+    size_t at = p + quoted.size(); // Skip whitespace, then require a real key (a colon).
+    while (at < json.size() && (json[at] == ' ' || json[at] == '\t' || json[at] == '\r' || json[at] == '\n')) ++at;
+    if (at >= json.size() || json[at] != ':') return {};
+    ++at;
+    while (at < json.size() && (json[at] == ' ' || json[at] == '\t' || json[at] == '\r' || json[at] == '\n')) ++at;
+    if (at >= json.size()) return {};
+    if (json[at] == '"') {
+        size_t q2 = json.find('"', at + 1);
+        return q2 == std::string::npos ? std::string() : json.substr(at + 1, q2 - at - 1);
+    }
+    if (json[at] == '[') {
+        size_t close = json.find(']', at);
+        return close == std::string::npos ? std::string() : json.substr(at + 1, close - at - 1);
+    }
+    return {};
+}
+
+// Write the current binding set to hotkeys.json. Only called to create the file
+// on first run so there is always something to edit; a file the user already has
+// is never rewritten by loading or reloading.
+static void SaveHotkeys() {
+    std::ofstream f(std::filesystem::path(HotkeysPath()), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    f << "{\n";
+    for (int a = 0; a < HK_COUNT; ++a) {
+        f << "  \"" << Utf8(HK_NAMES[a]) << "\": ";
+        const std::vector<Hotkey>& keys = g_hotkeys[a];
+        if (keys.size() == 1) {
+            f << '"' << Utf8(HotkeyText(keys[0])) << '"';
+        } else {
+            f << '[';
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i) f << ", ";
+                f << '"' << Utf8(HotkeyText(keys[i])) << '"';
+            }
+            f << ']';
+        }
+        f << (a + 1 == HK_COUNT ? "\n" : ",\n");
+    }
+    f << "}\n";
+}
+
+// Read hotkeys.json over the built-in defaults. A missing file writes the
+// defaults so there is always a file to edit; a malformed, unknown, or
+// duplicate entry is ignored and that action keeps its default (never an error).
+static void LoadHotkeys() {
+    ResetHotkeysToDefaults();
+    std::ifstream f(std::filesystem::path(HotkeysPath()), std::ios::binary);
+    if (!f) { SaveHotkeys(); return; }
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (int a = 0; a < HK_COUNT; ++a) {
+        std::string value = JsonValueField(json, Utf8(HK_NAMES[a]).c_str());
+        if (value.empty()) continue;
+        // Split array members on commas; a single binding is one member.
+        std::vector<Hotkey> parsed;
+        size_t start = 0;
+        while (start <= value.size()) {
+            size_t comma = value.find(',', start);
+            std::string member = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            size_t q1 = member.find('"'), q2 = member.find('"', q1 + 1);
+            Hotkey h;
+            if (q1 != std::string::npos && q2 != std::string::npos
+                && HotkeyFromText(Wide(member.substr(q1 + 1, q2 - q1 - 1)), h)) parsed.push_back(h);
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        if (!parsed.empty()) g_hotkeys[a] = parsed;
+    }
+}
+
+// The shortcut currently held down as modifier flags plus a virtual-key code.
+static Hotkey HotkeyFromKeysDown(WPARAM wp) {
+    Hotkey h;
+    h.vk = (UINT)wp;
+    if (GetKeyState(VK_CONTROL) & 0x8000) h.mods |= MOD_CONTROL;
+    if (GetKeyState(VK_SHIFT) & 0x8000) h.mods |= MOD_SHIFT;
+    if (GetKeyState(VK_MENU) & 0x8000) h.mods |= MOD_ALT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) h.mods |= MOD_WIN;
+    return h;
+}
+
+// The action bound to the key being pressed, or -1. Modifiers must match
+// exactly so that, say, Ctrl+Shift+R and Ctrl+R stay distinguishable.
+static int HotkeyAction(WPARAM wp) {
+    Hotkey pressed = HotkeyFromKeysDown(wp);
+    for (int a = 0; a < HK_COUNT; ++a)
+        for (const Hotkey& h : g_hotkeys[a])
+            if (h.vk == pressed.vk && h.mods == pressed.mods) return a;
+    return -1;
+}
+
+// The "(ctrl+shift+r)" style hint used in menus and buttons for an action.
+// Empty when the action has no binding (only possible via an empty list).
+static std::wstring HotkeyHint(int action) {
+    if (action < 0 || action >= HK_COUNT || g_hotkeys[action].empty()) return {};
+    std::wstring text = HotkeyText(g_hotkeys[action].front());
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+    return L"(" + text + L")";
 }
 
 // Paint a rectangle with one solid color, then release the temporary brush.
@@ -1135,46 +1369,44 @@ static void UpdateCheck(HWND hwnd) {
 // Window procedure for the main board window.
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_KEYDOWN:
-        // Ctrl+N is a keyboard shortcut for adding a card.
-        if (wp == 'N' && (GetKeyState(VK_CONTROL) & 0x8000)) { AddCard(hwnd); return 0; }
-        if (wp == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-            // Ctrl+Shift+R opens the free-form prompt; plain Ctrl+R keeps the structured template.
-            if (GetKeyState(VK_SHIFT) & 0x8000) ReportBugWithPrompt(hwnd); else ReportBug(hwnd);
-            return 0;
-        }
-        if (wp == 'U' && (GetKeyState(VK_CONTROL) & 0x8000)) { UpdateCheck(hwnd); return 0; }
-        // Arrow keys drive the board without a mouse: up/down pick the card to act on,
-        // left/right move that card between columns.
-        if (wp == VK_UP || wp == VK_DOWN) { SelectStep(hwnd, wp == VK_DOWN ? 1 : -1); return 0; }
-        if (wp == VK_LEFT || wp == VK_RIGHT) { MoveSelectedColumn(hwnd, wp == VK_RIGHT ? 1 : -1); return 0; }
-        // The remaining keyboard actions apply to the card under the last mouse position,
+case WM_KEYDOWN: {
+        // Every keyboard action is routed through the bindings loaded from
+        // hotkeys.json, so rebinding one action changes the whole board at once.
+        // The arrow-key selection, the report/update actions and the card
+        // actions below are all reached through that single dispatch.
+        int action = HotkeyAction(wp);
+        if (action < 0) break;
+        if (action == HK_ADD) { AddCard(hwnd); return 0; }
+        if (action == HK_SELECT_UP || action == HK_SELECT_DOWN) { SelectStep(hwnd, action == HK_SELECT_DOWN ? 1 : -1); return 0; }
+        if (action == HK_MOVE_LEFT || action == HK_MOVE_RIGHT) { MoveSelectedColumn(hwnd, action == HK_MOVE_RIGHT ? 1 : -1); return 0; }
+        if (action == HK_REPORT) { ReportBug(hwnd); return 0; }
+        if (action == HK_REPORT_PROMPT) { ReportBugWithPrompt(hwnd); return 0; }
+        if (action == HK_UPDATE) { UpdateCheck(hwnd); return 0; }
+        // The remaining actions apply to the card under the last mouse position,
         // or to the keyboard-selected card when the mouse is not over one.
-        if (wp == VK_SPACE || wp == VK_DELETE || wp == 'D' || wp == 'S' || wp == 'T' || wp == 'B') {
-            int hover = ActionIndex(hwnd);
-            if (hover < 0) return 0;
-            if (wp == VK_SPACE) {
-                // Edit card text.
-                std::wstring newText;
-                if (AskForCard(hwnd, newText, g_cards[hover].text)) {
-                    g_cards[hover].text = newText;
-                    SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
-                }
-            } else if (wp == VK_DELETE || wp == 'D') {
-                // Delete card.
-                g_cards.erase(g_cards.begin() + hover);
-                FixSelectionAfterErase(hover);
+        int hover = ActionIndex(hwnd);
+        if (hover < 0) return 0;
+        if (action == HK_EDIT) {
+            // Edit card text.
+            std::wstring newText;
+            if (AskForCard(hwnd, newText, g_cards[hover].text)) {
+                g_cards[hover].text = newText;
                 SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
-            } else if (wp == 'S') {
-                ToggleTimer(hwnd, hover);
-            } else if (wp == 'T') {
-                AskForTime(hwnd, hover);
-            } else { // 'B'
-                ToggleBlocked(hwnd, hover);
             }
-            return 0;
+        } else if (action == HK_DELETE) {
+            // Delete card.
+            g_cards.erase(g_cards.begin() + hover);
+            FixSelectionAfterErase(hover);
+            SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (action == HK_TOGGLE_TIMER) {
+            ToggleTimer(hwnd, hover);
+        } else if (action == HK_EDIT_TIMER) {
+            AskForTime(hwnd, hover);
+        } else { // HK_BLOCKED
+            ToggleBlocked(hwnd, hover);
         }
-        break;
+        return 0;
+    }
     case WM_LBUTTONDOWN: {
         // A press on a card either toggles a property (with a modifier) or starts a drag.
         POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1227,13 +1459,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring autoUpdateLabel = L"Automatic updates: ";
             autoUpdateLabel += g_settings.autoUpdate ? L"auto" : L"ask";
             std::wstring autoUpdateHint = L"(click to change)";
+            std::wstring reportHint = HotkeyHint(HK_REPORT);
+            std::wstring reportPromptHint = HotkeyHint(HK_REPORT_PROMPT);
+            std::wstring updateHint = HotkeyHint(HK_UPDATE);
             MenuItemData globalItems[] = {
-                { L"Report a Bug",          L"(ctrl+r)"       },
-                { L"Report with Prompt...", L"(ctrl+shift+r)" },
-                { L"Check for Updates",     L"(ctrl+u)"       },
-                { autoUpdateLabel.c_str(),  autoUpdateHint.c_str() },
+                { L"Report a Bug",          reportHint.c_str()       },
+                { L"Report with Prompt...", reportPromptHint.c_str() },
+                { L"Check for Updates",     updateHint.c_str()       },
+                { autoUpdateLabel.c_str(),  autoUpdateHint.c_str()   },
+                { L"Reload Hotkeys",        L"(re-reads the file)"   },
             };
-            const int globalCmds[] = { CMD_REPORT, CMD_REPORT_PROMPT, CMD_UPDATE, CMD_AUTO_UPDATE };
+            const int globalCmds[] = { CMD_REPORT, CMD_REPORT_PROMPT, CMD_UPDATE, CMD_AUTO_UPDATE, CMD_RELOAD_HOTKEYS };
             HMENU menu = CreatePopupMenu();
             for (size_t i = 0; i < _countof(globalItems); ++i)
                 AppendMenuW(menu, MF_OWNERDRAW, globalCmds[i], (LPCTSTR)&globalItems[i]);
@@ -1246,16 +1482,25 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_settings.autoUpdate = !g_settings.autoUpdate;
                 SaveSettings();
             }
+            else if (cmd == CMD_RELOAD_HOTKEYS) {
+                LoadHotkeys(); InvalidateRect(hwnd, nullptr, FALSE);
+            }
             return 0;
         }
         POINT screen = p; ClientToScreen(hwnd, &screen);
-        // Owner-drawn entries so the menu matches the dark theme.
+        // Owner-drawn entries so the menu matches the dark theme. The hints show
+        // the configured bindings, so a remap stays truthful in the menus too.
+        std::wstring editHint = HotkeyHint(HK_EDIT);
+        std::wstring deleteHint = HotkeyHint(HK_DELETE);
+        std::wstring toggleHint = HotkeyHint(HK_TOGGLE_TIMER);
+        std::wstring editTimerHint = HotkeyHint(HK_EDIT_TIMER);
+        std::wstring blockedHint = HotkeyHint(HK_BLOCKED);
         MenuItemData items[] = {
-            { L"Edit",          L"(space)" },
-            { L"Delete",        L"(d)"     },
-            { L"Toggle Timer",  L"(s)"     },
-            { L"Edit Timer",    L"(t)"     },
-            { L"Blocked",       L"(b)"     },
+            { L"Edit",          editHint.c_str()    },
+            { L"Delete",        deleteHint.c_str()  },
+            { L"Toggle Timer",  toggleHint.c_str()  },
+            { L"Edit Timer",    editTimerHint.c_str() },
+            { L"Blocked",       blockedHint.c_str() },
         };
         const int cmdIds[] = { CMD_EDIT, CMD_DELETE, CMD_TOGGLE_TIMER, CMD_EDIT_TIMER, CMD_BLOCKED };
         HMENU menu = CreatePopupMenu();
@@ -1378,7 +1623,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DrawTextW(mem, countText.c_str(), -1, &countRect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             if (c == 0) {
                 RECT add = AddRect(col); Fill(mem, add, RGB(42,42,42));
-                SetTextColor(mem, RGB(190,190,190)); DrawTextW(mem, L"+ Add a card (ctrl+n)", -1, &add, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                SetTextColor(mem, RGB(190,190,190));
+                std::wstring addLabel = L"+ Add a card " + HotkeyHint(HK_ADD);
+                DrawTextW(mem, addLabel.c_str(), -1, &add, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
         }
         // Draw cards that are not currently being dragged.
@@ -1479,6 +1726,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&promptClass);
     LoadCards(); // Restore the previous board before showing the window.
     LoadSettings();
+    LoadHotkeys();
     // Create the actual main window using the class registered above.
     HWND hwnd = CreateWindowExW(0, MAIN_CLASS, L"Minimal Kanban", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 920, 520, nullptr, nullptr, instance, nullptr);

@@ -57,13 +57,14 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `TITLES[3]` — column header strings.
 - `g_qpcFreq` — QPC frequency for stopwatch timing.
 - `g_liveTimerID` — Win32 timer ID (100ms tick) driving live stopwatch updates.
-- `CMD_EDIT`/`CMD_DELETE`/`CMD_TOGGLE_TIMER`/`CMD_EDIT_TIMER`/`CMD_BLOCKED` — context menu command IDs (`CMD_REPORT`/`CMD_REPORT_PROMPT`/`CMD_UPDATE`/`CMD_AUTO_UPDATE` — global menu command IDs).
+- `CMD_EDIT`/`CMD_DELETE`/`CMD_TOGGLE_TIMER`/`CMD_EDIT_TIMER`/`CMD_BLOCKED` — context menu command IDs (`CMD_REPORT`/`CMD_REPORT_PROMPT`/`CMD_UPDATE`/`CMD_AUTO_UPDATE`/`CMD_RELOAD_HOTKEYS` — global menu command IDs).
 - `MenuItemData` — owner-drawn context menu item struct (label + keyboard hint).
+- `HK_ADD`...`HK_UPDATE` (`HK_COUNT`-sized) — enum of the board actions that `hotkeys.json` can rebind; `HK_NAMES[HK_COUNT]` maps each action to its file key. `Hotkey{mods, vk}` is one shortcut (MOD_* flags + virtual-key). `g_hotkeys[HK_COUNT]` holds the current binding list per action (vector: an action can have several keys, e.g. delete = Del + D).
 - `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66) — constants. `PROMPT_CLIENT_W` (460), `PROMPT_CLIENT_H` (180), `PROMPT_LIMIT` (4000) — report prompt dialog size/text limits.
 
 ### Data Path (lines 27–39)
 
-- `DataPath()` — returns `%LOCALAPPDATA%\MinimalKanban\board.json`. Creates the directory if it doesn't exist. Falls back to `board.json` in CWD if SHGetKnownFolderPath fails.
+- `AppLocalDir()` — returns `%LOCALAPPDATA%\MinimalKanban` (created if missing). `DataPath()`/`SettingsPath()`/`HotkeysPath()` return the `board.json`/`settings.json`/`hotkeys.json` paths under it. Falls back to `.` if SHGetKnownFolderPath fails.
 
 ### String Conversion (lines 42–58)
 
@@ -76,6 +77,17 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `JsonUnescape(string)` — reverses the above.
 - `SaveCards()` — writes all cards to `board.json`. Writes `TotalElapsedMs` per card (persisted total, folding in the whole current run: paused-session time + any in-flight stretch) and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves. `column`, `text`, `blocked`, `timer_ms` per card.
 - `LoadCards()` — line-by-line parser that reads the format produced by `SaveCards`. Expects one `{"column": N, "text": "...", "blocked": true/false, "timer_ms": N}` per line. `blocked` and `timer_ms` are optional (default false/0) for backward compatibility with older save files. Silently skips malformed lines.
+
+### Hotkeys (Hotkey internals, ~lines 350–520)
+
+- `ResetHotkeysToDefaults()` — restores the shipped shortcut set into `g_hotkeys` (delete has both Del and D).
+- `HotkeyKeyFromName(wstring)` / `HotkeyKeyName(vk)` — name ↔ virtual-key tables for every bindable key (letters, digits, F1–F12, named keys, other printable chars); unknown/unbindable names return 0 / `"?"`.
+- `HotkeyText(Hotkey)` — canonical `"Ctrl+Shift+R"` spelling (modifiers in Ctrl, Shift, Alt, Win order) used for writing the file and hints.
+- `HotkeyFromText(wstring, Hotkey&)` — parses one `"Ctrl+Shift+R"` binding back into mods + vk; case-insensitive; rejects empty parts, duplicate key parts, and unknown modifiers/keys.
+- `SaveHotkeys()` / `LoadHotkeys()` — write/read `hotkeys.json`. `LoadHotkeys` starts from the defaults and replaces an action's bindings only when the file yields at least one valid entry; `SaveHotkeys` runs only when the file is missing (first run), so a user-edited file is never rewritten by a load or reload.
+- `JsonValueField(json, key)` — small helper that reads a string or array value for a given key out of the hotkeys file.
+- `HotkeyFromKeysDown(wp)` / `HotkeyAction(wp)` — build the pressed shortcut and match it against `g_hotkeys` (exact modifier match, so Ctrl+R and Ctrl+Shift+R stay distinct); returns -1 when nothing matches.
+- `HotkeyHint(action)` — the `"(ctrl+shift+r)"` display hint for menus/buttons from the first binding of an action, empty when unbound.
 
 ### Timer Helpers (lines 74–139)
 
@@ -138,11 +150,11 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — Ctrl+N triggers AddCard. **Ctrl+R** opens the structured bug report, **Ctrl+Shift+R** the free-form prompt, **Ctrl+U** the update check. **Up/Down** walk the board and select a card (blue outline); **Left/Right** move the selected card one column left/right. The remaining actions (the card under `g_lastMouse`, or the selected one when the mouse is not over a card): **Space** (edit), **Delete / D** (delete), **S** (toggle stopwatch), **T** (edit timer), **B** (toggle blocked).
+- **WM_KEYDOWN** — every keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Up/Down** select a card with the blue outline, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
 - **WM_LBUTTONUP** — drops card into whichever column the mouse is over.
-- **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit** (space), **Delete** (d), **Toggle Timer** (s), **Edit Timer** (t), **Blocked** (b). Wires to the same helpers as keyboard/mouse paths.
+- **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
 - **WM_MEASUREITEM** / **WM_DRAWITEM** — owner-drawn popup menu sizing/painting: black bg RGB(27,27,27), white label, gray right-aligned key hint, hover highlight RGB(70,70,70).
 - **WM_CAPTURECHANGED** — cancels drag if capture lost.
 - **WM_TIMER** — 100ms live tick: invalidates the window while any stopwatch is running; kills the timer when none are.
@@ -156,7 +168,7 @@ Handles all main board interactions:
 
 ### Entry Point (lines ~790–830)
 
-- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt), loads cards, creates main window (920×520), enables dark title bar, runs message loop.
+- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs message loop.
 
 ### Networking & Self-Updates (GitHub integration)
 
@@ -190,6 +202,38 @@ All network use is on-demand — there are no threads, timers, or persistent con
 - `blocked`: true/false (optional, defaults false)
 - `timer_ms`: accumulated stopwatch time in milliseconds (optional, defaults 0)
 
+`%LOCALAPPDATA%\MinimalKanban\hotkeys.json` (written once with the defaults on first run, then
+never rewritten by the app — edit it and reload via the right-click menu or restart):
+
+```json
+{
+  "add": "Ctrl+N",
+  "edit": "Space",
+  "delete": ["Del", "D"],
+  "toggle_timer": "S",
+  "edit_timer": "T",
+  "blocked": "B",
+  "select_up": "Up",
+  "select_down": "Down",
+  "move_left": "Left",
+  "move_right": "Right",
+  "report": "Ctrl+R",
+  "report_prompt": "Ctrl+Shift+R",
+  "update": "Ctrl+U"
+}
+```
+
+- Each key is an action name; the value is one binding `"Ctrl+Shift+R"` or a list `["Del", "D"]`.
+  Modifiers are `Ctrl`/`Shift`/`Alt`/`Win` joined with `+`; the key part is a letter, digit, F1–F12,
+  or a named key (Space, Del, Back, Enter, Esc, Tab, arrows, Home, End, PgUp, PgDn, PrtSc, Pause,
+  Ins). Names are case-insensitive.
+- Actions are rebound **exactly**: a press must match modifiers *and* key. `LoadHotkeys` starts from
+  the defaults and swaps in an action's bindings only when the file yields at least one valid entry;
+  malformed lines, unknown key names, and duplicate entries are silently ignored (default kept), and
+  a missing file just writes the defaults.
+- `Reload Hotkeys` (right-click empty board space) re-reads the file without restarting; the menu and
+  Add-button hints always reflect the currently configured bindings.
+
 ## Card Interactions
 
 | Action | Mouse | Keyboard |
@@ -207,6 +251,9 @@ All network use is on-demand — there are no threads, timers, or persistent con
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 
 Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The selected card is outlined in blue, and the red (blocked) and green (running) outlines take visual priority.
+
+Every keyboard shortcut above is a **default** editable in `hotkeys.json` (see Data Format); the keys
+shown in the menus and on the "+ Add a card" button always reflect the current bindings.
 
 ## Dialog Interactions
 
@@ -232,6 +279,7 @@ shortcuts:
 - **Shared action helpers** — stopwatch/blocked/edit/delete each have one implementation (mouse, keyboard, and menu all call the same helper) so behavior stays consistent.
 - **Timers keep running during save** — `SaveCards` writes the live total without stopping in-memory timers. On app close the total is persisted and restored as stopped.
 - **Extensible card properties** — the `Card` struct and `LoadCards`/`SaveCards` use defaults for missing fields, making it easy to add future properties.
+- **Configurable hotkeys** — the board's keyboard shortcuts come from `hotkeys.json`, and every part of the UI that shows a shortcut (context menus, "+ Add a card") renders the configured binding. Key matching is exact on modifiers so distinct chords stay distinct; the file is treated as user data and never rewritten after first run.
 
 ## BugBot (report automation)
 
