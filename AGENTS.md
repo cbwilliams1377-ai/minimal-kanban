@@ -46,7 +46,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Data Structures & Globals (lines 14–50)
 
-- `Card` — struct: `{ std::wstring text; int column; bool blocked; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `timerAccumulated` is completed time from before the current program run; `sessionAccumulated` is this run's paused-session time (not persisted, resets on close); `timerStart` is a QPC timestamp when running (0 = stopped).
+- `Card` — struct: `{ std::wstring text; int column; bool blocked; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `timerAccumulated` is the total lifetime time (folded in at load and by "New Day" resets); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "New Day" reset; `timerStart` is a QPC timestamp when running (0 = stopped).
 - `g_cards` — `vector<Card>`, the entire board state in memory.
 - `g_font` / `g_boldFont` — Segoe UI 16pt normal/semibold, created at startup.
 - `g_dragIndex` — index of card being dragged (-1 = none).
@@ -75,8 +75,8 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 - `JsonEscape(string)` — escapes `\`, `"`, `\n`, `\r`, `\t` for JSON strings.
 - `JsonUnescape(string)` — reverses the above.
-- `SaveCards()` — writes all cards to `board.json`. Writes `TotalElapsedMs` per card (persisted total, folding in the whole current run: paused-session time + any in-flight stretch) and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves. `column`, `text`, `blocked`, `timer_ms` per card.
-- `LoadCards()` — line-by-line parser that reads the format produced by `SaveCards`. Expects one `{"column": N, "text": "...", "blocked": true/false, "timer_ms": N}` per line. `blocked` and `timer_ms` are optional (default false/0) for backward compatibility with older save files. Silently skips malformed lines.
+- `SaveCards()` — writes all cards to `board.json`. Writes `timer_ms` (persisted total) and `session_ms` (live countup: paused-session time + any in-flight stretch) per card and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves and restarts. `column`, `text`, `blocked`, `timer_ms`, `session_ms` per card.
+- `LoadCards()` — line-by-line parser that reads the format produced by `SaveCards`. Expects one `{"column": N, "text": "...", "blocked": true/false, "timer_ms": N, "session_ms": N}` per line. `blocked`, `timer_ms` and `session_ms` are optional (default false/0) for backward compatibility with older save files. Silently skips malformed lines.
 
 ### Hotkeys (Hotkey internals, ~lines 350–520)
 
@@ -93,16 +93,19 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 - `NowMs()` — current time in milliseconds via QPC.
 - `SessionElapsedMs(Card&)` — milliseconds of the current running session (0 when stopped).
-- `TotalElapsedMs(Card&)` — total elapsed ms (accumulated + this run's paused sessions + active session if running); used for persistence and edit-timer pre-population.
+- `TotalElapsedMs(Card&)` — grand total elapsed ms (accumulated total + the countup); used only for edit-timer pre-population.
 - `FormatTimer(ms)` — formats to `ss`, `m:ss`, or `h:mm:ss` depending on magnitude.
 - `StartLiveTimer(HWND)` / `StopLiveTimer(HWND)` — manage the 100ms `WM_TIMER` tick.
-- `StopAllTimers()` — finalizes all running card timers into `sessionAccumulated` (currently unused; saves go through `TotalElapsedMs`).
+- `NowMs()` — current time in milliseconds via QPC.
+- `TodayDate()` — today's local date as `YYYY-MM-DD` for `settings.json` `last_reset`.
+- `StopAllTimers()` — finalizes all running card timers into `sessionAccumulated` (currently unused).
 - `AnyTimerRunning()` — true if any card has a live timer.
 
 ### Card Action Helpers (lines ~540–558)
 
 - `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time).
 - `ToggleBlocked(HWND, index)` — shared blocked-flag toggle (used by Ctrl+click, `B` key, and menu).
+- `NewDayReset(HWND)` — the "New Day" reset: folds every card's countup (running or paused, including ones carried over from earlier launches) into its `timerAccumulated`, stops all running stopwatches, stamps `settings.json` `last_reset` with today's date, and saves. Triggered by the menu item, the `new_day` hotkey, and automatically at launch when the recorded date is not today. Not undoable.
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
 - `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom).
 - `SelectStep(HWND, delta)` — moves the keyboard selection one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
@@ -157,11 +160,11 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Up/Down** select a card with the blue outline, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
+- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Ctrl+Y** New Day reset, **Up/Down** select a card with the blue outline, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
 - **WM_LBUTTONUP** — drops card into whichever column the mouse is over.
-- **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
+- **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, **New Day (reset countups)**, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
 - **WM_MEASUREITEM** / **WM_DRAWITEM** — owner-drawn popup menu sizing/painting: black bg RGB(27,27,27), white label, gray right-aligned key hint, hover highlight RGB(70,70,70).
 - **WM_CAPTURECHANGED** — cancels drag if capture lost.
 - **WM_TIMER** — 100ms live tick: invalidates the window while any stopwatch is running; kills the timer when none are.
@@ -170,12 +173,12 @@ Handles all main board interactions:
 - **WM_PAINT** — double-buffered painting:
   - Background RGB(27,27,27), column backgrounds RGB(39,39,39), headers RGB(43,43,43).
   - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. The **keyboard-selected** card gets a blue (RGB(60,130,230)) 3px outline. Blocked and running take drawing priority over the blue selection outline.
-  - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live countup** right-justified in green (RGB(50,180,50)) with a `+` prefix. The countup shows while running and stays frozen on the last value when paused; it only resets when the program closes (closing/saving appends the run to the total).
-- **WM_DESTROY** — stops live timer, saves (the whole current run is folded into the persisted total; it restores stopped with `sessionAccumulated` reset), frees fonts, posts quit.
+  - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live countup** right-justified in green (RGB(50,180,50)) with a `+` prefix. The countup shows while running and stays frozen on the last value when paused; it is persisted (`session_ms`) and only cleared by a "New Day" reset.
+- **WM_DESTROY** — stops live timer, saves (the countup is persisted in `session_ms`, so it restores stopped with the `+` display intact), frees fonts, posts quit.
 
 ### Entry Point (lines ~790–830)
 
-- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs message loop.
+- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs the automatic "New Day" reset if the last reset was not today, runs message loop.
 
 ### Networking & Self-Updates (GitHub integration)
 
@@ -197,9 +200,9 @@ All network use is on-demand — there are no threads, timers, or persistent con
 ```json
 {
   "cards": [
-    {"column": 0, "text": "Buy groceries", "blocked": false, "timer_ms": 0},
-    {"column": 1, "text": "Write docs", "blocked": false, "timer_ms": 90000},
-    {"column": 2, "text": "Ship v1.0", "blocked": true, "timer_ms": 5435000}
+    {"column": 0, "text": "Buy groceries", "blocked": false, "timer_ms": 0, "session_ms": 0},
+    {"column": 1, "text": "Write docs", "blocked": false, "timer_ms": 90000, "session_ms": 12500},
+    {"column": 2, "text": "Ship v1.0", "blocked": true, "timer_ms": 5435000, "session_ms": 0}
   ]
 }
 ```
@@ -207,7 +210,8 @@ All network use is on-demand — there are no threads, timers, or persistent con
 - `column`: integer 0, 1, or 2
 - `text`: UTF-8 string with JSON escaping
 - `blocked`: true/false (optional, defaults false)
-- `timer_ms`: accumulated stopwatch time in milliseconds (optional, defaults 0)
+- `timer_ms`: accumulated stopwatch time in milliseconds (optional, defaults 0); grows on "New Day" resets
+- `session_ms`: the live countup ("+" display) in milliseconds (optional, defaults 0); cleared by a "New Day" reset
 
 `%LOCALAPPDATA%\MinimalKanban\hotkeys.json` (written once with the defaults on first run, then
 never rewritten by the app — edit it and reload via the right-click menu or restart):
@@ -226,7 +230,8 @@ never rewritten by the app — edit it and reload via the right-click menu or re
   "move_right": "Right",
   "report": "Ctrl+R",
   "report_prompt": "Ctrl+Shift+R",
-  "update": "Ctrl+U"
+  "update": "Ctrl+U",
+  "new_day": "Ctrl+Y"
 }
 ```
 
@@ -256,6 +261,7 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 | File a bug report (opens browser) | Right-click empty space → Report a Bug | **Ctrl+R** |
 | File a report in your own words (opens browser) | Right-click empty space → Report with Prompt... | **Ctrl+Shift+R** |
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
+| New Day: fold every countup into its total and reset the board | Right-click empty space → New Day (reset countups) | **Ctrl+Y** (also runs automatically at launch when the last reset was not today) |
 
 Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The selected card is outlined in blue, and the red (blocked) and green (running) outlines take visual priority.
 
@@ -284,7 +290,7 @@ shortcuts:
 - **Forgiving persistence** — `LoadCards` skips malformed lines rather than crashing.
 - **Static linking** — executable is self-contained, no DLL dependencies.
 - **Shared action helpers** — stopwatch/blocked/edit/delete each have one implementation (mouse, keyboard, and menu all call the same helper) so behavior stays consistent.
-- **Timers keep running during save** — `SaveCards` writes the live total without stopping in-memory timers. On app close the total is persisted and restored as stopped.
+- **Timers keep running during save** — `SaveCards` writes `timer_ms` and `session_ms` without stopping in-memory timers, so a running or paused stopwatch survives saves and app closes with its countup intact. Timers restore stopped; running ones stay running only in memory until the next restart.
 - **Extensible card properties** — the `Card` struct and `LoadCards`/`SaveCards` use defaults for missing fields, making it easy to add future properties.
 - **Configurable hotkeys** — the board's keyboard shortcuts come from `hotkeys.json`, and every part of the UI that shows a shortcut (context menus, "+ Add a card") renders the configured binding. Key matching is exact on modifiers so distinct chords stay distinct; the file is treated as user data and never rewritten after first run.
 

@@ -22,13 +22,14 @@ struct Card {
     int column;
     bool blocked = false;
     LONGLONG timerAccumulated = 0; // completed time from runs before this program run
-    LONGLONG sessionAccumulated = 0; // this run's paused-session time; reset on app close
+    LONGLONG sessionAccumulated = 0; // paused countup time; persisted and cleared by a "New Day" reset
     LONGLONG timerStart = 0;       // QPC timestamp when running (0 = stopped)
 };
 
 struct Settings {
     bool autoUpdate = false;
     bool checkOnStartup = true;
+    std::wstring lastReset;          // "YYYY-MM-DD" of the last "New Day" reset ("" = never run).
 };
 
 // The board actions that hotkeys.json can rebind, in the order they are listed
@@ -37,7 +38,7 @@ struct Settings {
 enum {
     HK_ADD = 0, HK_EDIT, HK_DELETE, HK_TOGGLE_TIMER, HK_EDIT_TIMER, HK_BLOCKED,
     HK_SELECT_UP, HK_SELECT_DOWN, HK_MOVE_LEFT, HK_MOVE_RIGHT,
-    HK_REPORT, HK_REPORT_PROMPT, HK_UPDATE, HK_COUNT
+    HK_REPORT, HK_REPORT_PROMPT, HK_UPDATE, HK_NEW_DAY, HK_COUNT
 };
 
 // One keyboard shortcut: modifier flags (MOD_*) plus a virtual-key code.
@@ -64,7 +65,7 @@ static const wchar_t* APP_VERSION = L"0.1.7";
 static const wchar_t* HK_NAMES[HK_COUNT] = {
     L"add", L"edit", L"delete", L"toggle_timer", L"edit_timer", L"blocked",
     L"select_up", L"select_down", L"move_left", L"move_right",
-    L"report", L"report_prompt", L"update"
+    L"report", L"report_prompt", L"update", L"new_day"
 };
 // The current binding set, loaded from hotkeys.json at startup or on "Reload Hotkeys".
 static std::vector<Hotkey> g_hotkeys[HK_COUNT];
@@ -92,6 +93,7 @@ static volatile LONG g_updateCancelled = 0;
 #define CMD_AUTO_UPDATE 8
 #define CMD_REPORT_PROMPT 9
 #define CMD_RELOAD_HOTKEYS 10
+#define CMD_NEW_DAY 11
 
 // Size limits for the natural-language report prompt dialog.
 #define PROMPT_CLIENT_W 460 // Dialog client width in pixels.
@@ -152,12 +154,19 @@ static LONGLONG SessionElapsedMs(const Card& c) {
     return NowMs() - c.timerStart;
 }
 
-// Get the total elapsed milliseconds for a card, folding the current run in.
-// The current run is sessionAccumulated (paused stretches) plus the in-flight
-// session when running. Used when persisting so time is never lost ("session
-// closed/saved appends that time to the persisted total").
+// Get the grand total elapsed milliseconds for a card (accumulated total plus
+// the live countup). Used only to pre-fill the "Set timer" dialog; persistence
+// writes timer_ms and session_ms separately so the countup survives saves.
 static LONGLONG TotalElapsedMs(const Card& c) {
     return c.timerAccumulated + c.sessionAccumulated + SessionElapsedMs(c);
+}
+
+// Return today's local date as "YYYY-MM-DD", used to stamp "New Day" resets.
+static std::wstring TodayDate() {
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    wchar_t buf[16];
+    swprintf(buf, 16, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+    return buf;
 }
 
 // Format milliseconds into a display string: ss, m:ss, or h:mm:ss.
@@ -187,8 +196,8 @@ static void StopLiveTimer(HWND hwnd) {
     if (g_liveTimerID != 0) { KillTimer(hwnd, TIMER_LIVE); g_liveTimerID = 0; }
 }
 
-// Finalize all running card timers into their run counters. Kept for symmetry with
-// the pause path in ToggleTimer (currently unused; saves go through TotalElapsedMs).
+// Finalize all running card timers into their countups. Kept for symmetry with
+// the pause path in ToggleTimer (currently unused).
 static void StopAllTimers() {
     LONGLONG now = NowMs();
     for (auto& c : g_cards) {
@@ -261,10 +270,10 @@ static std::wstring JsonStringField(const std::string& json, const char* key) {
 }
 
 // Write every card to the board.json file.
-// Timers are NOT stopped here: TotalElapsedMs includes the whole current run
-// (accumulated history + session pauses + any in-flight stretch), so the saved
-// value is always the current total. (WM_DESTROY saves; on reload the restored
-// board always shows stopped timers because sessionAccumulated is not persisted.)
+// Timers are NOT stopped here: "timer_ms" is the accumulated total and
+// "session_ms" is the live countup (paused stretches plus any in-flight run),
+// so a running or paused stopwatch survives saves and restarts with its "+"
+// display intact. (WM_DESTROY saves; on reload the timers restore stopped.)
 static void SaveCards() {
     // trunc clears the previous file before writing the current board.
     std::ofstream f(std::filesystem::path(DataPath()), std::ios::binary | std::ios::trunc);
@@ -274,7 +283,8 @@ static void SaveCards() {
         f << "    {\"column\": " << g_cards[i].column
           << ", \"text\": \"" << JsonEscape(Utf8(g_cards[i].text)) << "\""
           << ", \"blocked\": " << (g_cards[i].blocked ? "true" : "false")
-          << ", \"timer_ms\": " << TotalElapsedMs(g_cards[i])
+          << ", \"timer_ms\": " << g_cards[i].timerAccumulated
+          << ", \"session_ms\": " << (g_cards[i].sessionAccumulated + SessionElapsedMs(g_cards[i]))
           << "}";
         if (i + 1 != g_cards.size()) f << ',';
         f << '\n';
@@ -330,6 +340,17 @@ static void LoadCards() {
                 try { card.timerAccumulated = std::stoll(line.substr(tcolon + 1, tcomma - tcolon - 1)); } catch (...) {}
             }
         }
+        // Parse optional "session_ms" field: the persisted countup (default 0 for
+        // backward compatibility). Restored stopped; a live run is not resumed.
+        size_t sp = line.find("\"session_ms\"");
+        if (sp != std::string::npos) {
+            size_t scolon = line.find(':', sp);
+            if (scolon != std::string::npos) {
+                size_t scomma = line.find(',', scolon);
+                if (scomma == std::string::npos) scomma = line.find('}', scolon);
+                try { card.sessionAccumulated = std::stoll(line.substr(scolon + 1, scomma - scolon - 1)); } catch (...) {}
+            }
+        }
         g_cards.push_back(card);
     }
 }
@@ -341,13 +362,15 @@ static void LoadSettings() {
     std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     g_settings.autoUpdate = JsonStringField(json, "update_mode") == L"auto";
     g_settings.checkOnStartup = JsonBoolField(json, "check_on_startup", true);
+    g_settings.lastReset = JsonStringField(json, "last_reset");
 }
 
 static void SaveSettings() {
     std::ofstream f(std::filesystem::path(SettingsPath()), std::ios::binary | std::ios::trunc);
     if (!f) return;
     f << "{\n  \"update_mode\": \"" << (g_settings.autoUpdate ? "auto" : "ask") << "\""
-      << ",\n  \"check_on_startup\": " << (g_settings.checkOnStartup ? "true" : "false") << "\n}\n";
+      << ",\n  \"check_on_startup\": " << (g_settings.checkOnStartup ? "true" : "false")
+      << ",\n  \"last_reset\": \"" << JsonEscape(Utf8(g_settings.lastReset)) << "\"\n}\n";
 }
 
 // Hotkeys: an editable config file that rebinds the board's keyboard shortcuts.
@@ -368,6 +391,7 @@ static void ResetHotkeysToDefaults() {
     g_hotkeys[HK_REPORT]        = { { MOD_CONTROL, 'R' } };
     g_hotkeys[HK_REPORT_PROMPT] = { { MOD_CONTROL | MOD_SHIFT, 'R' } };
     g_hotkeys[HK_UPDATE]        = { { MOD_CONTROL, 'U' } };
+    g_hotkeys[HK_NEW_DAY]       = { { MOD_CONTROL, 'Y' } };
 }
 
 // Turn one key name (as written in hotkeys.json) into a virtual-key code.
@@ -624,7 +648,7 @@ static std::wstring BuildHelpText() {
     t += L"Cards:\r\n";
     t += L"  Task text - the card's description\r\n";
     t += L"  Gray time - the total stopwatch time\r\n";
-    t += L"  Green +time - the current stopwatch countup (running or paused)\r\n";
+    t += L"  Green +time - the current stopwatch countup (running or paused; survives restarts, cleared by New Day)\r\n";
     t += L"  Red outline - the card is blocked\r\n";
     t += L"  Green outline - the stopwatch is running on this card\r\n";
     t += L"  Blue outline - the card is selected with the arrow keys\r\n";
@@ -652,6 +676,7 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  File a bug report", HK_REPORT) + L"\r\n";
     t += HelpBindingLine(L"  File a report in your own words", HK_REPORT_PROMPT) + L"\r\n";
     t += HelpBindingLine(L"  Check for updates", HK_UPDATE) + L"\r\n";
+    t += HelpBindingLine(L"  New Day: fold every countup into its total", HK_NEW_DAY) + L"\r\n";
     t += L"\r\n";
     t += L"Keyboard card actions apply to the card under the mouse, falling back\r\n";
     t += L"to the selected card when the pointer is not over one.\r\n";
@@ -1144,8 +1169,8 @@ static bool AskForReportPrompt(HWND owner, std::wstring& out) {
 // is paused first (freezing its in-flight stretch into sessionAccumulated), so
 // exactly one stopwatch runs at a time and it is the one the user just toggled.
 // Pausing freezes the in-flight stretch into sessionAccumulated instead of the
-// accumulated total, so the live countup keeps displaying the value (it only
-// resets when the program closes and the card reloads).
+// accumulated total, so the live countup keeps displaying the value (it is only
+// cleared by a "New Day" reset).
 static void ToggleTimer(HWND hwnd, int index) {
     if (g_cards[index].timerStart != 0) {
         g_cards[index].sessionAccumulated += (NowMs() - g_cards[index].timerStart);
@@ -1168,6 +1193,28 @@ static void ToggleTimer(HWND hwnd, int index) {
 static void ToggleBlocked(HWND hwnd, int index) {
     g_cards[index].blocked = !g_cards[index].blocked;
     SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// The "New Day" reset: fold every card's live countup (running or paused,
+// including countups carried over from earlier launches) into its accumulated
+// total, stop all running stopwatches, and stamp the reset date so the automatic
+// launch variant does not run twice the same day. The reset is not undoable; the
+// user restarts any stopwatch they want running afterwards.
+static void NewDayReset(HWND hwnd) {
+    LONGLONG now = NowMs();
+    bool reset = false;
+    for (auto& c : g_cards) {
+        if (c.sessionAccumulated == 0 && c.timerStart == 0) continue;
+        c.timerAccumulated += c.sessionAccumulated + (c.timerStart != 0 ? now - c.timerStart : 0);
+        c.sessionAccumulated = 0;
+        c.timerStart = 0;
+        reset = true;
+    }
+    g_settings.lastReset = TodayDate();
+    SaveSettings();
+    SaveCards();
+    StopLiveTimer(hwnd);
+    if (reset) InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 // Return the index of the card under a client-space point, or -1 if none.
@@ -1514,6 +1561,7 @@ case WM_KEYDOWN: {
         if (action == HK_REPORT) { ReportBug(hwnd); return 0; }
         if (action == HK_REPORT_PROMPT) { ReportBugWithPrompt(hwnd); return 0; }
         if (action == HK_UPDATE) { UpdateCheck(hwnd); return 0; }
+        if (action == HK_NEW_DAY) { NewDayReset(hwnd); return 0; }
         // The remaining actions apply to the card under the last mouse position,
         // or to the keyboard-selected card when the mouse is not over one.
         int hover = ActionIndex(hwnd);
@@ -1594,14 +1642,16 @@ case WM_KEYDOWN: {
             std::wstring reportHint = HotkeyHint(HK_REPORT);
             std::wstring reportPromptHint = HotkeyHint(HK_REPORT_PROMPT);
             std::wstring updateHint = HotkeyHint(HK_UPDATE);
+            std::wstring newDayHint = HotkeyHint(HK_NEW_DAY);
             MenuItemData globalItems[] = {
-                { L"Report a Bug",          reportHint.c_str()       },
-                { L"Report with Prompt...", reportPromptHint.c_str() },
-                { L"Check for Updates",     updateHint.c_str()       },
-                { autoUpdateLabel.c_str(),  autoUpdateHint.c_str()   },
-                { L"Reload Hotkeys",        L"(re-reads the file)"   },
+                { L"Report a Bug",           reportHint.c_str()       },
+                { L"Report with Prompt...",  reportPromptHint.c_str() },
+                { L"Check for Updates",      updateHint.c_str()       },
+                { autoUpdateLabel.c_str(),   autoUpdateHint.c_str()   },
+                { L"New Day (reset countups)", newDayHint.c_str()     },
+                { L"Reload Hotkeys",         L"(re-reads the file)"   },
             };
-            const int globalCmds[] = { CMD_REPORT, CMD_REPORT_PROMPT, CMD_UPDATE, CMD_AUTO_UPDATE, CMD_RELOAD_HOTKEYS };
+            const int globalCmds[] = { CMD_REPORT, CMD_REPORT_PROMPT, CMD_UPDATE, CMD_AUTO_UPDATE, CMD_NEW_DAY, CMD_RELOAD_HOTKEYS };
             HMENU menu = CreatePopupMenu();
             for (size_t i = 0; i < _countof(globalItems); ++i)
                 AppendMenuW(menu, MF_OWNERDRAW, globalCmds[i], (LPCTSTR)&globalItems[i]);
@@ -1614,6 +1664,7 @@ case WM_KEYDOWN: {
                 g_settings.autoUpdate = !g_settings.autoUpdate;
                 SaveSettings();
             }
+            else if (cmd == CMD_NEW_DAY) NewDayReset(hwnd);
             else if (cmd == CMD_RELOAD_HOTKEYS) {
                 LoadHotkeys(); InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -1789,8 +1840,8 @@ case WM_KEYDOWN: {
             DrawTextW(mem, g_cards[index].text.c_str(), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             // Timer row (below task text): total time left-justified in gray,
             // live countup right-justified in green with a "+". The countup shows
-            // while running and stays frozen on the last value when paused; it only
-            // resets when the program closes (sessionAccumulated is not persisted).
+            // while running and stays frozen on the last value when paused; it is
+            // persisted and only cleared by a "New Day" reset.
             RECT lower = r; lower.left += 12; lower.right -= 12; lower.top = r.top + 30; lower.bottom = r.bottom;
             if (g_cards[index].timerAccumulated > 0) {
                 SelectObject(mem, g_font); SetTextColor(mem, RGB(140, 140, 140));
@@ -1869,6 +1920,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         CW_USEDEFAULT, CW_USEDEFAULT, 920, 520, nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
     SetDarkTitleBar(hwnd);
+    // Automatic "New Day": at launch, fold and reset the countups when the last
+    // reset was not today ("" on first run means it applies too).
+    if (g_settings.lastReset != TodayDate()) NewDayReset(hwnd);
     ShowWindow(hwnd, show); // Make the window visible.
     UpdateWindow(hwnd); // Ask Windows to send WM_PAINT immediately.
     PostMessageW(hwnd, WM_APP_UPDATE_CHECK, 0, 0);
