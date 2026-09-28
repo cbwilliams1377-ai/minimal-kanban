@@ -55,6 +55,7 @@ static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main w
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
 static const wchar_t* PROMPT_CLASS = L"MinimalKanbanReportPrompt"; // Name of the report prompt window class.
+static const wchar_t* CONFIRM_CLASS = L"MinimalKanbanConfirm"; // Name of the delete confirmation window class.
 static const wchar_t* HELP_CLASS = L"MinimalKanbanHelp"; // Name of the F1 help window class.
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
@@ -99,6 +100,11 @@ static volatile LONG g_updateCancelled = 0;
 #define PROMPT_CLIENT_W 460 // Dialog client width in pixels.
 #define PROMPT_CLIENT_H 180 // Dialog client height in pixels.
 #define PROMPT_LIMIT 4000  // Max characters accepted so the issue URL never gets unwieldy.
+
+// Size of the delete confirmation dialog, and how much of the card text it shows.
+#define CONFIRM_CLIENT_W 360 // Dialog client width in pixels.
+#define CONFIRM_CLIENT_H 150 // Dialog client height in pixels.
+#define CONFIRM_TEXT_MAX 120 // Max characters of the card text quoted in the prompt.
 
 // Owner-drawn menu item: the label plus the keyboard-hint shown right-aligned.
 struct MenuItemData { const wchar_t* text; const wchar_t* hint; };
@@ -665,7 +671,7 @@ static std::wstring BuildHelpText() {
     t += L"  F1 - show this help page\r\n";
     t += HelpBindingLine(L"  Add a new card", HK_ADD) + L"\r\n";
     t += HelpBindingLine(L"  Edit card text", HK_EDIT) + L"\r\n";
-    t += HelpBindingLine(L"  Delete card", HK_DELETE) + L"\r\n";
+    t += HelpBindingLine(L"  Delete card (asks to confirm)", HK_DELETE) + L"\r\n";
     t += HelpBindingLine(L"  Toggle stopwatch", HK_TOGGLE_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Set stopwatch time manually", HK_EDIT_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Toggle blocked flag", HK_BLOCKED) + L"\r\n";
@@ -685,6 +691,7 @@ static std::wstring BuildHelpText() {
     t += L"  Enter / Esc - accept or dismiss the add-card and set-timer dialogs\r\n";
     t += L"  Ctrl+Backspace - delete the previous word in a text box\r\n";
     t += L"  Ctrl+Enter - submit the \"Report with your own words\" dialog\r\n";
+    t += L"  Deleting a card always asks first: Enter deletes, Esc or Backspace keeps it\r\n";
     t += L"\r\n";
     t += L"The shortcuts above are configured in hotkeys.json next to the app.\r\n";
     t += L"Edit that file and choose \"Reload Hotkeys\" (right-click empty board\r\n";
@@ -798,12 +805,21 @@ static void DeleteWordBack(HWND edit) {
 }
 
 // Shared modal loop for the app's dialogs. Besides pumping messages until the
-// dialog closes, it supplies two shortcuts the dialog plumbing swallows:
-// Ctrl+Backspace deletes the previous word in the text box, and dialogs that ask
-// for it (the report prompt) get Ctrl+Enter as a shortcut for the Submit button.
+// dialog closes, it supplies the shortcuts the dialog plumbing swallows:
+// Ctrl+Backspace deletes the previous word in the text box, dialogs that have no
+// text box at all (the delete confirmation) treat a plain Backspace as "no", and
+// dialogs that ask for it (the report prompt) get Ctrl+Enter as a shortcut for
+// the Submit button.
 static void PumpDialog(HWND dlg, HWND edit, bool* done, bool ctrlEnterSubmits) {
     MSG msg;
     while (!*done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_BACK && !edit) {
+            // No text box to edit, so Backspace is the second "no" key next to Esc.
+            // Handled here because a focused child control would swallow the key
+            // before it reached the dialog's own window procedure.
+            SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), (LPARAM)GetDlgItem(dlg, IDCANCEL));
+            continue;
+        }
         if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
             if (msg.wParam == VK_BACK && edit && GetFocus() == edit) {
                 DeleteWordBack(edit);
@@ -1164,6 +1180,96 @@ static bool AskForReportPrompt(HWND owner, std::wstring& out) {
     return state.accepted;
 }
 
+// State for the delete confirmation dialog.
+struct ConfirmState { HWND edit = nullptr; bool done = false; bool accepted = false; std::wstring question; std::wstring detail; };
+static ConfirmState* g_confirm = nullptr;
+
+// Window procedure for the delete confirmation dialog: a question, the card text it
+// is about to drop, and Delete/Cancel. Delete is the default button, so Enter
+// confirms; Esc and Backspace both cancel.
+static LRESULT CALLBACK ConfirmProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        CreateWindowW(L"STATIC", g_confirm->question.c_str(),
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 12, 328, 20, hwnd, (HMENU)101, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowW(L"STATIC", g_confirm->detail.c_str(),
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 16, 38, 328, 60, hwnd, (HMENU)102, GetModuleHandleW(nullptr), nullptr);
+        HWND deleteButton = CreateWindowW(L"BUTTON", L"Delete", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
+            188, 112, 75, 28, hwnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
+        HWND cancelButton = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            269, 112, 75, 28, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
+        HMODULE uxtheme = LoadLibraryW(L"uxtheme.dll");
+        if (uxtheme) {
+            using SetWindowThemeFn = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+            auto setWindowTheme = reinterpret_cast<SetWindowThemeFn>(GetProcAddress(uxtheme, "SetWindowTheme"));
+            if (setWindowTheme) { setWindowTheme(deleteButton, L"", L""); setWindowTheme(cancelButton, L"", L""); }
+            FreeLibrary(uxtheme);
+        }
+        for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+            SendMessageW(child, WM_SETFONT, (WPARAM)g_font, TRUE);
+        SetFocus(deleteButton);
+        return 0;
+    }
+    case WM_ERASEBKGND: { RECT client{}; GetClientRect(hwnd, &client); Fill((HDC)wp, client, RGB(32,32,32)); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wp; SetTextColor(dc, RGB(230,230,230)); SetBkColor(dc, RGB(32,32,32));
+        static HBRUSH brush = CreateSolidBrush(RGB(32,32,32)); return (LRESULT)brush;
+    }
+    case WM_CTLCOLORBTN: {
+        HDC dc = (HDC)wp; SetTextColor(dc, RGB(230,230,230)); SetBkColor(dc, RGB(50,50,50));
+        static HBRUSH brush = CreateSolidBrush(RGB(50,50,50)); return (LRESULT)brush;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* ds = (DRAWITEMSTRUCT*)lp;
+        if (ds->CtlType == ODT_BUTTON) {
+            // The Delete button is tinted red so the destructive action stands out.
+            bool isDelete = ds->itemID == IDOK;
+            HBRUSH br = CreateSolidBrush(isDelete ? RGB(70, 32, 32) : RGB(50, 50, 50));
+            FillRect(ds->hDC, &ds->rcItem, br); DeleteObject(br);
+            SetTextColor(ds->hDC, isDelete ? RGB(255, 190, 190) : RGB(230, 230, 230));
+            SetBkMode(ds->hDC, TRANSPARENT);
+            wchar_t buf[64];
+            GetWindowTextW(ds->hwndItem, buf, 64);
+            DrawTextW(ds->hDC, buf, -1, &ds->rcItem, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            if (ds->itemState & ODS_FOCUS) { RECT r = ds->rcItem; InflateRect(&r, -3, -3); DrawFocusRect(ds->hDC, &r); }
+            return TRUE;
+        }
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) { g_confirm->accepted = true; DestroyWindow(hwnd); return 0; }
+        if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0; }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Ask the user to confirm a destructive action. Returns true only when the user
+// picks Delete (the default button, so Enter confirms; Esc and Backspace cancel).
+static bool AskConfirm(HWND owner, const std::wstring& question, const std::wstring& detail) {
+    ConfirmState state;
+    state.question = question;
+    state.detail = detail;
+    g_confirm = &state;
+    const DWORD style = WS_CAPTION | WS_SYSMENU;
+    const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+    // Size the window from the desired client area so the controls always fit.
+    RECT frame{0, 0, CONFIRM_CLIENT_W, CONFIRM_CLIENT_H};
+    AdjustWindowRectEx(&frame, style, FALSE, exStyle);
+    int w = frame.right - frame.left, h = frame.bottom - frame.top;
+    RECT pr{}; GetWindowRect(owner, &pr);
+    int x = pr.left + (pr.right - pr.left - w) / 2;
+    int y = pr.top + (pr.bottom - pr.top - h) / 2;
+    EnableWindow(owner, FALSE); // Make the main window temporarily non-interactive.
+    HWND dlg = CreateWindowExW(exStyle, CONFIRM_CLASS, L"Please confirm",
+        style | WS_VISIBLE, x, y, w, h, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!dlg) { EnableWindow(owner, TRUE); g_confirm = nullptr; return false; }
+    SetDarkTitleBar(dlg);
+    PumpDialog(dlg, state.edit, &state.done, false);
+    EnableWindow(owner, TRUE); SetForegroundWindow(owner); g_confirm = nullptr;
+    return state.accepted;
+}
+
 // Toggle the stopwatch for a card: start when stopped, pause when running.
 // Starting while another card is running switches the run over: the previous card
 // is paused first (freezing its in-flight stretch into sessionAccumulated), so
@@ -1268,6 +1374,19 @@ static int ActionIndex(HWND hwnd) {
 static void FixSelectionAfterErase(int erased) {
     if (g_selected == erased) g_selected = -1;
     else if (g_selected > erased) --g_selected;
+}
+
+// Delete a card once the user has confirmed it. Every delete path (the hotkey and
+// the context menu) comes through here, so none of them can drop a card silently.
+// The confirmation quotes the card text so the user can see what is going away.
+static void DeleteCard(HWND hwnd, int index) {
+    if (index < 0 || index >= static_cast<int>(g_cards.size())) return;
+    std::wstring detail = Trim(g_cards[index].text);
+    if (detail.size() > CONFIRM_TEXT_MAX) { detail.resize(CONFIRM_TEXT_MAX); detail += L"..."; }
+    if (!AskConfirm(hwnd, L"Delete this card?", detail)) return;
+    g_cards.erase(g_cards.begin() + index);
+    FixSelectionAfterErase(index);
+    SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 // Percent-encode a string for use in a URL query string (UTF-8 aware).
@@ -1574,10 +1693,8 @@ case WM_KEYDOWN: {
                 SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
             }
         } else if (action == HK_DELETE) {
-            // Delete card.
-            g_cards.erase(g_cards.begin() + hover);
-            FixSelectionAfterErase(hover);
-            SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+            // Delete card, after the confirmation dialog.
+            DeleteCard(hwnd, hover);
         } else if (action == HK_TOGGLE_TIMER) {
             ToggleTimer(hwnd, hover);
         } else if (action == HK_EDIT_TIMER) {
@@ -1701,9 +1818,7 @@ case WM_KEYDOWN: {
             break;
         }
         case CMD_DELETE:
-            g_cards.erase(g_cards.begin() + target);
-            FixSelectionAfterErase(target);
-            SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+            DeleteCard(hwnd, target);
             break;
         case CMD_TOGGLE_TIMER:
             ToggleTimer(hwnd, target);
@@ -1907,6 +2022,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     promptClass.lpfnWndProc = PromptInputProc; promptClass.hInstance = instance; promptClass.lpszClassName = PROMPT_CLASS;
     promptClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); promptClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassExW(&promptClass);
+    // Register the delete confirmation dialog class.
+    WNDCLASSEXW confirmClass{sizeof(confirmClass)};
+    confirmClass.lpfnWndProc = ConfirmProc; confirmClass.hInstance = instance; confirmClass.lpszClassName = CONFIRM_CLASS;
+    confirmClass.hCursor = LoadCursorW(nullptr, IDC_ARROW); confirmClass.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassExW(&confirmClass);
     // Register the F1 help window class.
     WNDCLASSEXW helpClass{sizeof(helpClass)};
     helpClass.lpfnWndProc = HelpProc; helpClass.hInstance = instance; helpClass.lpszClassName = HELP_CLASS;
