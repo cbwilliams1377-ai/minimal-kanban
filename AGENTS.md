@@ -53,14 +53,14 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `g_dragPoint` — mouse position during drag.
 - `g_lastMouse` — last known mouse position, drives hover-based keyboard actions.
 - `g_selected` — index of the card picked with the arrow keys (-1 = nothing selected).
-- `MAIN_CLASS` / `INPUT_CLASS` / `TIME_CLASS` / `PROMPT_CLASS` — Win32 window class names.
+- `MAIN_CLASS` / `INPUT_CLASS` / `TIME_CLASS` / `PROMPT_CLASS` / `CONFIRM_CLASS` — Win32 window class names.
 - `TITLES[3]` — column header strings.
 - `g_qpcFreq` — QPC frequency for stopwatch timing.
 - `g_liveTimerID` — Win32 timer ID (100ms tick) driving live stopwatch updates.
 - `CMD_EDIT`/`CMD_DELETE`/`CMD_TOGGLE_TIMER`/`CMD_EDIT_TIMER`/`CMD_BLOCKED` — context menu command IDs (`CMD_REPORT`/`CMD_REPORT_PROMPT`/`CMD_UPDATE`/`CMD_AUTO_UPDATE`/`CMD_RELOAD_HOTKEYS` — global menu command IDs).
 - `MenuItemData` — owner-drawn context menu item struct (label + keyboard hint).
 - `HK_ADD`...`HK_UPDATE` (`HK_COUNT`-sized) — enum of the board actions that `hotkeys.json` can rebind; `HK_NAMES[HK_COUNT]` maps each action to its file key. `Hotkey{mods, vk}` is one shortcut (MOD_* flags + virtual-key). `g_hotkeys[HK_COUNT]` holds the current binding list per action (vector: an action can have several keys, e.g. delete = Del + D).
-- `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66) — constants. `PROMPT_CLIENT_W` (460), `PROMPT_CLIENT_H` (180), `PROMPT_LIMIT` (4000) — report prompt dialog size/text limits.
+- `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66) — constants. `PROMPT_CLIENT_W` (460), `PROMPT_CLIENT_H` (180), `PROMPT_LIMIT` (4000) — report prompt dialog size/text limits. `CONFIRM_CLIENT_W` (360), `CONFIRM_CLIENT_H` (150), `CONFIRM_TEXT_MAX` (120) — delete confirmation dialog size and how much card text it quotes.
 
 ### Data Path (lines 27–39)
 
@@ -112,6 +112,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it stays selected afterwards.
 - `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the keyboard-selected card.
 - `FixSelectionAfterErase(int)` — keeps `g_selected` on the same card after a deletion shifts the vector.
+- `DeleteCard(HWND, index)` — shared delete path (used by the `Delete`/`D` key and the context menu): asks for confirmation first, then erases, fixes the selection, saves and redraws. See the Delete Confirmation Dialog below.
 
 ### GDI Drawing Helpers (lines 229–276)
 
@@ -126,7 +127,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `EditText(HWND edit)` — reads an edit control's contents into a `std::wstring`.
 - `IsWordSeparator(wchar_t)` — whitespace test used when walking back a word.
 - `DeleteWordBack(HWND edit)` — implements **Ctrl+Backspace** (delete the word, and any whitespace before it, in front of the caret) by selecting the range and clearing it. Windows' edit control never receives that combination through `IsDialogMessage`, so the dialogs run it themselves.
-- `PumpDialog(HWND dlg, HWND edit, bool* done, bool ctrlEnterSubmits)` — the one modal message loop all three dialogs use. It forwards the **Ctrl+Backspace** above when the text box has focus, and, when `ctrlEnterSubmits` is set, turns **Ctrl+Enter** into the dialog's IDOK (used by the report prompt's Submit).
+- `PumpDialog(HWND dlg, HWND edit, bool* done, bool ctrlEnterSubmits)` — the one modal message loop all four dialogs use. It forwards the **Ctrl+Backspace** above when the text box has focus, turns a plain **Backspace** into the dialog's IDCANCEL when the dialog has no text box at all (the delete confirmation), and, when `ctrlEnterSubmits` is set, turns **Ctrl+Enter** into the dialog's IDOK (used by the report prompt's Submit).
 
 ### Add-Card Dialog (lines 278–395)
 
@@ -148,6 +149,13 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `PromptInputProc()` — window procedure for the "Report with your own words" dialog (its own class, `PROMPT_CLASS`). Mirrors the other dialogs: WM_CREATE builds a hint label, a `ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN` edit capped at `PROMPT_LIMIT` (4000) chars, and owner-drawn **Submit**/**Cancel** buttons; WM_DRAWITEM paints them. Submit is deliberately *not* `BS_DEFPUSHBUTTON` so Enter inserts a newline instead of submitting — **Ctrl+Enter** is the submit shortcut instead (handled by `PumpDialog`).
 - `AskForReportPrompt(HWND owner, wstring& out)` — modal loop (owner disabled, `AdjustWindowRectEx`-sized to a 460x180 client area); returns true only when the user submits non-blank text.
 - `Trim(wstring)` — shared leading/trailing whitespace trim used for the title and the blank check.
+
+### Delete Confirmation Dialog
+
+- `ConfirmState` — tracks the confirmation dialog state: done/accepted flags plus the question and the card text it quotes.
+- `ConfirmProc()` — window procedure for the confirmation dialog (its own class, `CONFIRM_CLASS`). WM_CREATE builds a question label, a wrapped label quoting the card, and owner-drawn **Delete**/**Cancel** buttons; WM_DRAWITEM paints them, tinting Delete red. **Delete** is `BS_DEFPUSHBUTTON`, so **Enter** confirms; **Esc** (via `IsDialogMessage`) and **Backspace** (via `PumpDialog`) both cancel. There is no text box.
+- `AskConfirm(HWND owner, wstring question, wstring detail)` — modal loop (owner disabled, `AdjustWindowRectEx`-sized to a 360x150 client area); returns true only when the user picks Delete.
+- `DeleteCard(HWND, int index)` — the single delete path: asks first (quoting up to `CONFIRM_TEXT_MAX` characters of the card), then erases the card, fixes the keyboard selection, saves and redraws. Both the **Delete**/**D** hotkey and the context menu's **Delete** call it, so neither can drop a card without confirming.
 
 ### F1 Help Page
 
@@ -178,7 +186,7 @@ Handles all main board interactions:
 
 ### Entry Point (lines ~790–830)
 
-- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs the automatic "New Day" reset if the last reset was not today, runs message loop.
+- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt, delete confirmation), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs the automatic "New Day" reset if the last reset was not today, runs message loop.
 
 ### Networking & Self-Updates (GitHub integration)
 
@@ -255,7 +263,7 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 | Toggle stopwatch start/stop (starts a running stopwatch on the other card) | Shift+left-click | **S** |
 | Toggle blocked flag (red outline) | Ctrl+left-click | **B** |
 | Edit card text | Right-click → Edit | **Space** |
-| Delete card | Right-click → Delete | **Delete** or **D** |
+| Delete card (asks for confirmation first) | Right-click → Delete | **Delete** or **D** |
 | Set stopwatch time manually | Right-click → Edit Timer | **T** |
 | Add new card | Click "+ Add a card" | **Ctrl+N** |
 | File a bug report (opens browser) | Right-click empty space → Report a Bug | **Ctrl+R** |
@@ -270,14 +278,15 @@ shown in the menus and on the "+ Add a card" button always reflect the current b
 
 ## Dialog Interactions
 
-All three dialogs (add/edit card, set timer, report prompt) share one modal loop, so they share these
-shortcuts:
+All four dialogs (add/edit card, set timer, report prompt, delete confirmation) share one modal loop,
+so they share these shortcuts:
 
 | Action | Keyboard |
 |--------|----------|
 | Delete the previous word in the text box | **Ctrl+Backspace** |
 | Submit the "Report with your own words" dialog (Enter inserts a newline there) | **Ctrl+Enter** |
 | Accept / dismiss the add-card and set-timer dialogs | **Enter** / **Esc** |
+| Confirm / dismiss the delete confirmation (it has no text box) | **Enter** / **Esc** or **Backspace** |
 
 ## Conventions
 
