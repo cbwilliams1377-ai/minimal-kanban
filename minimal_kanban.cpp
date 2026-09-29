@@ -50,7 +50,8 @@ static HFONT g_font = nullptr, g_boldFont = nullptr; // Fonts used while drawing
 static int g_dragIndex = -1; // Index of the card being dragged; -1 means no drag is active.
 static POINT g_dragPoint{}; // Current mouse position while dragging a card.
 static POINT g_lastMouse{}; // Last known mouse position, used for hover-based keyboard actions.
-static int g_selected = -1; // Index of the card chosen with the keyboard; -1 means nothing is selected.
+static int g_selected = -1; // Index of the card the focus box is on; -1 means the box is hidden.
+static LONGLONG g_focusAt = 0; // When the focus box last moved (QPC ms); 0 = no idle countdown pending.
 static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main window class.
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
@@ -72,6 +73,7 @@ static const wchar_t* HK_NAMES[HK_COUNT] = {
 static std::vector<Hotkey> g_hotkeys[HK_COUNT];
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
+static UINT_PTR g_focusTimerID = 0;      // Win32 timer ID for the focus box idle countdown (0 = not running).
 static HWND g_helpHwnd = nullptr;        // Handle of the F1 help window (0 = closed).
 // Cached double-buffer used by WM_PAINT. Allocating a full-window bitmap on
 // every paint made the process footprint grow (the live stopwatch repaints ten
@@ -84,6 +86,8 @@ static volatile LONG g_updateBusy = 0;
 static volatile LONG g_updateCancelled = 0;
 
 #define TIMER_LIVE 1                     // Timer ID for the live stopwatch tick.
+#define TIMER_FOCUS 2                    // Timer ID for the focus box idle countdown tick.
+#define FOCUS_IDLE_MS 10000              // Idle time before the focus box falls back to the running stopwatch.
 #define CARD_HEIGHT 60                   // Height of each card in pixels.
 #define CARD_SPACING 66                  // Vertical spacing between cards.
 #define WM_APP_UPDATE_CHECK (WM_APP + 1)
@@ -224,6 +228,47 @@ static void StopAllTimers() {
 static bool AnyTimerRunning() {
     for (const auto& c : g_cards) if (c.timerStart != 0) return true;
     return false;
+}
+
+// Return the index of the card whose stopwatch is running, or -1 when none is.
+static int RunningTimerIndex() {
+    for (size_t i = 0; i < g_cards.size(); ++i) if (g_cards[i].timerStart != 0) return (int)i;
+    return -1;
+}
+
+// Start the 1s focus countdown if not already running.
+static void StartFocusTimer(HWND hwnd) {
+    if (g_focusTimerID == 0) g_focusTimerID = SetTimer(hwnd, TIMER_FOCUS, 1000, nullptr);
+}
+
+// Kill the focus countdown if running.
+static void StopFocusTimer(HWND hwnd) {
+    if (g_focusTimerID != 0) { KillTimer(hwnd, TIMER_FOCUS); g_focusTimerID = 0; }
+}
+
+// Move the focus box onto a card (or hide it with -1), restart its idle
+// countdown, and repaint. Every path that moves the box comes through here, so
+// one rule holds everywhere: the box lands on whatever the user just acted on
+// and quietly returns to the running stopwatch after FOCUS_IDLE_MS of idling.
+static void FocusCard(HWND hwnd, int index) {
+    if (index < 0 || index >= (int)g_cards.size()) index = -1;
+    g_selected = index;
+    g_focusAt = index >= 0 ? NowMs() : 0;
+    if (g_focusAt != 0) StartFocusTimer(hwnd); else StopFocusTimer(hwnd);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// The focus box's idle tick: once the box has sat untouched for FOCUS_IDLE_MS it
+// returns to the card with the running stopwatch, or disappears when no
+// stopwatch is running, so an idle box never draws the eye to a random card.
+static void FocusIdleTimeout(HWND hwnd) {
+    if (g_focusAt == 0 || NowMs() - g_focusAt < FOCUS_IDLE_MS) return;
+    int running = RunningTimerIndex();
+    g_focusAt = 0;
+    StopFocusTimer(hwnd);
+    if (g_selected == running) return; // The fallback lands where the box already was.
+    g_selected = running;
+    InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 // Escape characters that have special meaning inside a JSON string.
@@ -692,7 +737,8 @@ static std::wstring BuildHelpText() {
     t += L"  Green +time - the current stopwatch countup (running or paused; survives restarts, cleared by New Day)\r\n";
     t += L"  Red outline - the card is blocked\r\n";
     t += L"  Green outline - the stopwatch is running on this card\r\n";
-    t += L"  Blue outline - the card is selected with the arrow keys\r\n";
+    t += L"  Black outline - the focus box: the card the arrow keys picked, or the card you last acted on\r\n";
+    t += L"    After 10 idle seconds it returns to the card with the running stopwatch, or goes away when none runs\r\n";
     t += L"\r\n";
     t += L"Mouse:\r\n";
     t += L"  Click \"+ Add a card\" - add a task to the Todo column\r\n";
@@ -720,7 +766,9 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  New Day: fold every countup into its total", HK_NEW_DAY) + L"\r\n";
     t += L"\r\n";
     t += L"Keyboard card actions apply to the card under the mouse, falling back\r\n";
-    t += L"to the selected card when the pointer is not over one.\r\n";
+    t += L"to the focused card when the pointer is not over one. Acting on a card\r\n";
+    t += L"(stopwatch, blocked, edit) moves the focus box onto it, and so does adding\r\n";
+    t += L"a card.\r\n";
     t += L"\r\n";
     t += L"Dialogs:\r\n";
     t += L"  Enter / Esc - accept or dismiss the add-card and set-timer dialogs\r\n";
@@ -986,12 +1034,14 @@ static bool AskForCard(HWND owner, std::wstring& out, const std::wstring& initia
 }
 
 // Ask for a card, add it to the Todo column, save it, and redraw the board.
+// A newly created card takes the focus box, so it is where the board points
+// right after it appears.
 static void AddCard(HWND hwnd) {
     std::wstring text;
     if (AskForCard(hwnd, text)) {
         g_cards.push_back({text, 0});
         SaveCards();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        FocusCard(hwnd, (int)g_cards.size() - 1);
     }
 }
 
@@ -1103,7 +1153,7 @@ static void AskForTime(HWND hwnd, int cardIndex) {
             g_cards[cardIndex].timerAccumulated = parsed;
             g_cards[cardIndex].timerStart = 0; // stopped after manual entry
             g_cards[cardIndex].sessionAccumulated = 0; // explicit set lets the run countup start fresh
-            SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+            SaveCards(); FocusCard(hwnd, cardIndex);
         }
     }
     g_timeInput = nullptr;
@@ -1327,13 +1377,13 @@ static void ToggleTimer(HWND hwnd, int index) {
         g_cards[index].timerStart = now;
         StartLiveTimer(hwnd);
     }
-    SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+    SaveCards(); FocusCard(hwnd, index); // Acting on a card pulls the focus box onto it.
 }
 
 // Toggle the blocked flag for a card.
 static void ToggleBlocked(HWND hwnd, int index) {
     g_cards[index].blocked = !g_cards[index].blocked;
-    SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+    SaveCards(); FocusCard(hwnd, index); // Acting on a card pulls the focus box onto it.
 }
 
 // The "New Day" reset: fold every card's live countup (running or paused,
@@ -1373,19 +1423,18 @@ static std::vector<int> VisibleOrder() {
     return order;
 }
 
-// Move the keyboard selection one card up (-1) or down (+1) in on-screen order.
-// With nothing selected yet, stepping down starts at the top card and stepping
-// up starts at the bottom one; the selection stops at the ends instead of wrapping.
+// Move the focus box one card up (-1) or down (+1) in on-screen order.
+// With nothing focused yet, stepping down starts at the top card and stepping
+// up starts at the bottom one; the box stops at the ends instead of wrapping.
 static void SelectStep(HWND hwnd, int delta) {
     std::vector<int> order = VisibleOrder();
-    if (order.empty()) { g_selected = -1; InvalidateRect(hwnd, nullptr, FALSE); return; }
+    if (order.empty()) { FocusCard(hwnd, -1); return; }
     int pos = -1;
     for (size_t i = 0; i < order.size(); ++i) if (order[i] == g_selected) { pos = (int)i; break; }
     if (pos < 0) pos = delta > 0 ? -1 : (int)order.size();
     int next = pos + delta;
     if (next < 0 || next >= (int)order.size()) return; // Already at the first/last card.
-    g_selected = order[next];
-    InvalidateRect(hwnd, nullptr, FALSE);
+    FocusCard(hwnd, order[next]);
 }
 
 // Move the selected card one column left (-1) or right (+1); it stays selected afterwards.
@@ -1394,7 +1443,7 @@ static void MoveSelectedColumn(HWND hwnd, int delta) {
     int column = g_cards[g_selected].column + delta;
     if (column < 0 || column > 2) return; // Already in the first/last column.
     g_cards[g_selected].column = column;
-    SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+    SaveCards(); FocusCard(hwnd, g_selected);
 }
 
 // The card a keyboard action applies to: the one under the mouse if there is one,
@@ -1406,9 +1455,10 @@ static int ActionIndex(HWND hwnd) {
 }
 
 // Keep the keyboard selection on the same card after one is erased from the vector.
-static void FixSelectionAfterErase(int erased) {
+static void FixSelectionAfterErase(HWND hwnd, int erased) {
     if (g_selected == erased) g_selected = -1;
     else if (g_selected > erased) --g_selected;
+    FocusCard(hwnd, g_selected); // Hides the box when the focused card is the one that went away.
 }
 
 // Delete a card once the user has confirmed it. Every delete path (the hotkey and
@@ -1420,7 +1470,7 @@ static void DeleteCard(HWND hwnd, int index) {
     if (detail.size() > CONFIRM_TEXT_MAX) { detail.resize(CONFIRM_TEXT_MAX); detail += L"..."; }
     if (!AskConfirm(hwnd, L"Delete this card?", detail)) return;
     g_cards.erase(g_cards.begin() + index);
-    FixSelectionAfterErase(index);
+    FixSelectionAfterErase(hwnd, index);
     SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -1725,7 +1775,7 @@ case WM_KEYDOWN: {
             std::wstring newText;
             if (AskForCard(hwnd, newText, g_cards[hover].text)) {
                 g_cards[hover].text = newText;
-                SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+                SaveCards(); FocusCard(hwnd, hover);
             }
         } else if (action == HK_DELETE) {
             // Delete card, after the confirmation dialog.
@@ -1848,7 +1898,7 @@ case WM_KEYDOWN: {
             std::wstring newText;
             if (AskForCard(hwnd, newText, g_cards[target].text)) {
                 g_cards[target].text = newText;
-                SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
+                SaveCards(); FocusCard(hwnd, target);
             }
             break;
         }
@@ -1929,6 +1979,8 @@ case WM_KEYDOWN: {
             if (AnyTimerRunning()) InvalidateRect(hwnd, nullptr, FALSE);
             else StopLiveTimer(hwnd);
         }
+        // Focus box tick: hand the box back once it has been idle long enough.
+        if (wp == TIMER_FOCUS) FocusIdleTimeout(hwnd);
         return 0;
     case WM_SIZE: InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_ERASEBKGND: return 1;
@@ -1965,15 +2017,15 @@ case WM_KEYDOWN: {
         auto rects = CardRects(client);
         HPEN penBlocked = CreatePen(PS_SOLID, 3, RGB(220, 50, 50));
         HPEN penTimer = CreatePen(PS_SOLID, 3, RGB(50, 180, 50));
-        HPEN penSelected = CreatePen(PS_SOLID, 3, RGB(60, 130, 230));
+        HPEN penSelected = CreatePen(PS_SOLID, 3, RGB(0, 0, 0));
         HPEN penOld = (HPEN)SelectObject(mem, GetStockObject(NULL_PEN));
         HBRUSH brOld = (HBRUSH)SelectObject(mem, GetStockObject(NULL_BRUSH));
         for (auto [index, r] : rects) {
             if (index == g_dragIndex) continue;
             // Card background.
             Fill(mem, r, RGB(50,50,50));
-            // Draw outline: blocked (red) or timer running (green); the keyboard selection
-            // is blue and only shows when neither of those applies.
+            // Draw outline: blocked (red) or timer running (green); the focus box
+            // is black and only shows when neither of those applies.
             if (g_cards[index].blocked) {
                 SelectObject(mem, penBlocked);
                 Rectangle(mem, r.left, r.top, r.right, r.bottom);
@@ -2019,6 +2071,7 @@ case WM_KEYDOWN: {
         // Save before closing, release GDI objects, and end the message loop.
         InterlockedExchange(&g_updateCancelled, 1);
         StopLiveTimer(hwnd);
+        StopFocusTimer(hwnd);
         ReleaseBackBuffer();
         SaveCards(); if (g_font) DeleteObject(g_font); if (g_boldFont) DeleteObject(g_boldFont); PostQuitMessage(0); return 0;
     }

@@ -52,7 +52,8 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `g_dragIndex` — index of card being dragged (-1 = none).
 - `g_dragPoint` — mouse position during drag.
 - `g_lastMouse` — last known mouse position, drives hover-based keyboard actions.
-- `g_selected` — index of the card picked with the arrow keys (-1 = nothing selected).
+- `g_selected` — index of the card the focus box is on (-1 = the box is hidden).
+- `g_focusAt` — when the focus box last moved (QPC ms); 0 = no idle countdown pending.
 - `MAIN_CLASS` / `INPUT_CLASS` / `TIME_CLASS` / `PROMPT_CLASS` / `CONFIRM_CLASS` — Win32 window class names.
 - `TITLES[3]` — column header strings.
 - `g_qpcFreq` — QPC frequency for stopwatch timing.
@@ -100,6 +101,13 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `TodayDate()` — today's local date as `YYYY-MM-DD` for `settings.json` `last_reset`.
 - `StopAllTimers()` — finalizes all running card timers into `sessionAccumulated` (currently unused).
 - `AnyTimerRunning()` — true if any card has a live timer.
+- `RunningTimerIndex()` — index of the card whose stopwatch is running, or -1 when none is.
+
+### Focus Box Helpers
+
+- `StartFocusTimer(HWND)` / `StopFocusTimer(HWND)` — manage the 1s `WM_TIMER` (`TIMER_FOCUS`) idle countdown.
+- `FocusCard(HWND, index)` — the single way the focus box moves: sets `g_selected` (index, or -1 to hide it), stamps `g_focusAt`, arms/clears the countdown, and repaints. Every path that focuses a card (arrow keys, add card, toggle stopwatch, toggle blocked, edit, edit timer, delete fixup) goes through it, so acting on a card always pulls the box onto it and restarts the countdown.
+- `FocusIdleTimeout(HWND)` — the `WM_TIMER` tick: after `FOCUS_IDLE_MS` (10s) with no focus activity the box falls back to the card with the running stopwatch, or disappears when no stopwatch runs, and the countdown stops until the box next moves.
 
 ### Card Action Helpers (lines ~540–558)
 
@@ -108,10 +116,10 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `NewDayReset(HWND)` — the "New Day" reset: folds every card's countup (running or paused, including ones carried over from earlier launches) into its `timerAccumulated`, stops all running stopwatches, stamps `settings.json` `last_reset` with today's date, and saves. Triggered by the menu item, the `new_day` hotkey, and automatically at launch when the recorded date is not today. Not undoable.
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
 - `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom).
-- `SelectStep(HWND, delta)` — moves the keyboard selection one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
-- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it stays selected afterwards.
-- `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the keyboard-selected card.
-- `FixSelectionAfterErase(int)` — keeps `g_selected` on the same card after a deletion shifts the vector.
+- `SelectStep(HWND, delta)` — moves the focus box one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
+- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box.
+- `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the focused card.
+- `FixSelectionAfterErase(HWND, int)` — keeps `g_selected` on the same card after a deletion shifts the vector, hiding the box when the focused card is the one that went away.
 - `DeleteCard(HWND, index)` — shared delete path (used by the `Delete`/`D` key and the context menu): asks for confirmation first, then erases, fixes the selection, saves and redraws. See the Delete Confirmation Dialog below.
 
 ### GDI Drawing Helpers (lines 229–276)
@@ -168,21 +176,21 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Ctrl+Y** New Day reset, **Up/Down** select a card with the blue outline, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
+- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Ctrl+Y** New Day reset, **Up/Down** select a card with the focus box, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
 - **WM_LBUTTONUP** — drops card into whichever column the mouse is over.
 - **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, **New Day (reset countups)**, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
 - **WM_MEASUREITEM** / **WM_DRAWITEM** — owner-drawn popup menu sizing/painting: black bg RGB(27,27,27), white label, gray right-aligned key hint, hover highlight RGB(70,70,70).
 - **WM_CAPTURECHANGED** — cancels drag if capture lost.
-- **WM_TIMER** — 100ms live tick: invalidates the window while any stopwatch is running; kills the timer when none are.
+- **WM_TIMER** — 100ms live tick: invalidates the window while any stopwatch is running; kills the timer when none are. `TIMER_FOCUS` is the 1s focus-idle tick (`FocusIdleTimeout`).
 - **WM_SIZE** — triggers full redraw.
 - **WM_ERASEBKGND** — returns 1 (all painting happens in WM_PAINT).
 - **WM_PAINT** — double-buffered painting:
   - Background RGB(27,27,27), column backgrounds RGB(39,39,39), headers RGB(43,43,43).
-  - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. The **keyboard-selected** card gets a blue (RGB(60,130,230)) 3px outline. Blocked and running take drawing priority over the blue selection outline.
+  - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. The **focused** card gets a black (RGB(0,0,0)) 3px outline, so the box reads as a subtle marker instead of a highlight. Blocked and running take drawing priority over the focus outline.
   - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live countup** right-justified in green (RGB(50,180,50)) with a `+` prefix. The countup shows while running and stays frozen on the last value when paused; it is persisted (`session_ms`) and only cleared by a "New Day" reset.
-- **WM_DESTROY** — stops live timer, saves (the countup is persisted in `session_ms`, so it restores stopped with the `+` display intact), frees fonts, posts quit.
+- **WM_DESTROY** — stops the live and focus timers, saves (the countup is persisted in `session_ms`, so it restores stopped with the `+` display intact), frees fonts, posts quit.
 
 ### Entry Point (lines ~790–830)
 
@@ -258,7 +266,7 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 
 | Action | Mouse | Keyboard |
 |--------|-------|----------|
-| Select a card | Hover the pointer over it | **Up** / **Down** (blue outline) |
+| Select a card | Hover the pointer over it | **Up** / **Down** (focus box) |
 | Move card between columns | Drag (plain click) | **Left** / **Right** on the selected card |
 | Toggle stopwatch start/stop (starts a running stopwatch on the other card) | Shift+left-click | **S** |
 | Toggle blocked flag (red outline) | Ctrl+left-click | **B** |
@@ -271,7 +279,9 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 | New Day: fold every countup into its total and reset the board | Right-click empty space → New Day (reset countups) | **Ctrl+Y** (also runs automatically at launch when the last reset was not today) |
 
-Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The selected card is outlined in blue, and the red (blocked) and green (running) outlines take visual priority.
+Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The focused card is outlined in black, and the red (blocked) and green (running) outlines take visual priority.
+
+The **focus box** is a black 3px outline and follows the user: it lands on the card the arrow keys picked, on a newly created card, and on any card an action ran against (stopwatch, blocked, edit, edit timer). After `FOCUS_IDLE_MS` (10s) without focus activity it falls back to the card with the running stopwatch, or disappears when no stopwatch is running, so an untouched box never sits drawing attention to a random card.
 
 Every keyboard shortcut above is a **default** editable in `hotkeys.json` (see Data Format); the keys
 shown in the menus and on the "+ Add a card" button always reflect the current bindings.
