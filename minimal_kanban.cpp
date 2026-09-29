@@ -22,14 +22,13 @@ struct Card {
     int column;
     bool blocked = false;
     LONGLONG timerAccumulated = 0; // completed time from runs before this program run
-    LONGLONG sessionAccumulated = 0; // paused countup time; persisted and cleared by a "New Day" reset
+    LONGLONG sessionAccumulated = 0; // paused countup time; persisted and cleared by a "Reset Time"
     LONGLONG timerStart = 0;       // QPC timestamp when running (0 = stopped)
 };
 
 struct Settings {
     bool autoUpdate = false;
     bool checkOnStartup = true;
-    std::wstring lastReset;          // "YYYY-MM-DD" of the last "New Day" reset ("" = never run).
 };
 
 // The board actions that hotkeys.json can rebind, in the order they are listed
@@ -63,7 +62,9 @@ static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
 static const wchar_t* APP_VERSION = L"0.1.11";
 // Names of the rebindable actions, used both as hotkeys.json keys and when
-// matching a pressed key back to its action.
+// matching a pressed key back to its action. "new_day" keeps its original file
+// key even though the action is now called "Reset Time", so hotkeys.json files
+// written by earlier builds keep working untouched.
 static const wchar_t* HK_NAMES[HK_COUNT] = {
     L"add", L"edit", L"delete", L"toggle_timer", L"edit_timer", L"blocked",
     L"select_up", L"select_down", L"move_left", L"move_right",
@@ -175,14 +176,6 @@ static LONGLONG SessionElapsedMs(const Card& c) {
 // writes timer_ms and session_ms separately so the countup survives saves.
 static LONGLONG TotalElapsedMs(const Card& c) {
     return c.timerAccumulated + c.sessionAccumulated + SessionElapsedMs(c);
-}
-
-// Return today's local date as "YYYY-MM-DD", used to stamp "New Day" resets.
-static std::wstring TodayDate() {
-    SYSTEMTIME st{}; GetLocalTime(&st);
-    wchar_t buf[16];
-    swprintf(buf, 16, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
-    return buf;
 }
 
 // Format milliseconds into a display string: ss, m:ss, or h:mm:ss.
@@ -331,6 +324,7 @@ static std::wstring JsonStringField(const std::string& json, const char* key) {
 // "session_ms" is the live countup (paused stretches plus any in-flight run),
 // so a running or paused stopwatch survives saves and restarts with its "+"
 // display intact. (WM_DESTROY saves; on reload the timers restore stopped.)
+// Only "Reset Time" ever folds a countup into a total.
 static void SaveCards() {
     // trunc clears the previous file before writing the current board.
     std::ofstream f(std::filesystem::path(DataPath()), std::ios::binary | std::ios::trunc);
@@ -419,15 +413,13 @@ static void LoadSettings() {
     std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     g_settings.autoUpdate = JsonStringField(json, "update_mode") == L"auto";
     g_settings.checkOnStartup = JsonBoolField(json, "check_on_startup", true);
-    g_settings.lastReset = JsonStringField(json, "last_reset");
 }
 
 static void SaveSettings() {
     std::ofstream f(std::filesystem::path(SettingsPath()), std::ios::binary | std::ios::trunc);
     if (!f) return;
     f << "{\n  \"update_mode\": \"" << (g_settings.autoUpdate ? "auto" : "ask") << "\""
-      << ",\n  \"check_on_startup\": " << (g_settings.checkOnStartup ? "true" : "false")
-      << ",\n  \"last_reset\": \"" << JsonEscape(Utf8(g_settings.lastReset)) << "\"\n}\n";
+      << ",\n  \"check_on_startup\": " << (g_settings.checkOnStartup ? "true" : "false") << "\n}\n";
 }
 
 // Hotkeys: an editable config file that rebinds the board's keyboard shortcuts.
@@ -690,6 +682,9 @@ static RECT ColumnRect(const RECT& client, int column) {
 // Calculate the clickable "Add a card" area at the bottom of the first column.
 static RECT AddRect(const RECT& col) { return {col.left + 10, col.bottom - 40, col.right - 10, col.bottom - 10}; }
 
+// Calculate the clickable "Reset Time" area at the bottom of the In-Progress column.
+static RECT ResetRect(const RECT& col) { return {col.left + 10, col.bottom - 40, col.right - 10, col.bottom - 10}; }
+
 // Ask Windows to use a dark title bar when that feature is available.
 static void SetDarkTitleBar(HWND hwnd) {
     HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -734,7 +729,8 @@ static std::wstring BuildHelpText() {
     t += L"Cards:\r\n";
     t += L"  Task text - the card's description\r\n";
     t += L"  Gray time - the total stopwatch time\r\n";
-    t += L"  Green +time - the current stopwatch countup (running or paused; survives restarts, cleared by New Day)\r\n";
+    t += L"  Green +time - the current stopwatch countup (running or paused; survives restarts, cleared by Reset Time)\r\n";
+    t += L"    A stopwatch only counts up on a card in the Todo column, and moving a card out of Todo pauses it\r\n";
     t += L"  Red outline - the card is blocked\r\n";
     t += L"  Green outline - the stopwatch is running on this card\r\n";
     t += L"  Black outline - the focus box: the card the arrow keys picked, or the card you last acted on\r\n";
@@ -742,8 +738,9 @@ static std::wstring BuildHelpText() {
     t += L"\r\n";
     t += L"Mouse:\r\n";
     t += L"  Click \"+ Add a card\" - add a task to the Todo column\r\n";
-    t += L"  Drag a card - move it to another column\r\n";
-    t += L"  Shift+click a card - start/stop its stopwatch\r\n";
+    t += L"  Click \"Reset Time\" at the bottom of In-Progress - push every countup into its card's total\r\n";
+    t += L"  Drag a card - move it to another column (leaving Todo pauses its stopwatch)\r\n";
+    t += L"  Shift+click a card - start/stop its stopwatch (Todo cards only)\r\n";
     t += L"  Ctrl+click a card - toggle its blocked flag\r\n";
     t += L"  Right-click a card - edit, delete or set its timer\r\n";
     t += L"  Right-click empty board space - reports, updates, reload hotkeys\r\n";
@@ -753,7 +750,7 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  Add a new card", HK_ADD) + L"\r\n";
     t += HelpBindingLine(L"  Edit card text", HK_EDIT) + L"\r\n";
     t += HelpBindingLine(L"  Delete card (asks to confirm)", HK_DELETE) + L"\r\n";
-    t += HelpBindingLine(L"  Toggle stopwatch", HK_TOGGLE_TIMER) + L"\r\n";
+    t += HelpBindingLine(L"  Toggle stopwatch (Todo cards only)", HK_TOGGLE_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Set stopwatch time manually", HK_EDIT_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Toggle blocked flag", HK_BLOCKED) + L"\r\n";
     t += HelpBindingLine(L"  Select previous card", HK_SELECT_UP) + L"\r\n";
@@ -763,7 +760,7 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  File a bug report", HK_REPORT) + L"\r\n";
     t += HelpBindingLine(L"  File a report in your own words", HK_REPORT_PROMPT) + L"\r\n";
     t += HelpBindingLine(L"  Check for updates", HK_UPDATE) + L"\r\n";
-    t += HelpBindingLine(L"  New Day: fold every countup into its total", HK_NEW_DAY) + L"\r\n";
+    t += HelpBindingLine(L"  Reset Time: fold every countup into its total", HK_NEW_DAY) + L"\r\n";
     t += L"\r\n";
     t += L"Keyboard card actions apply to the card under the mouse, falling back\r\n";
     t += L"to the focused card when the pointer is not over one. Acting on a card\r\n";
@@ -1355,26 +1352,40 @@ static bool AskConfirm(HWND owner, const std::wstring& question, const std::wstr
     return state.accepted;
 }
 
+// Pause a card's stopwatch, freezing its in-flight stretch into the countup so
+// the "+" display keeps the value it had. Every path that ends a run comes
+// through here: the pause toggle, switching the run to another card, and a card
+// leaving the Todo column (the only column a stopwatch may count up in).
+static void PauseCardTimer(int index) {
+    if (g_cards[index].timerStart == 0) return;
+    g_cards[index].sessionAccumulated += (NowMs() - g_cards[index].timerStart);
+    g_cards[index].timerStart = 0;
+}
+
 // Toggle the stopwatch for a card: start when stopped, pause when running.
-// Starting while another card is running switches the run over: the previous card
-// is paused first (freezing its in-flight stretch into sessionAccumulated), so
-// exactly one stopwatch runs at a time and it is the one the user just toggled.
+// A stopwatch only counts up on a card in the Todo column, so starting one
+// anywhere else is refused with a short explanation. Starting while another card
+// is running switches the run over: the previous card is paused first (freezing
+// its in-flight stretch into sessionAccumulated), so exactly one stopwatch runs
+// at a time and it is the one the user just toggled.
 // Pausing freezes the in-flight stretch into sessionAccumulated instead of the
 // accumulated total, so the live countup keeps displaying the value (it is only
-// cleared by a "New Day" reset).
+// cleared by a "Reset Time").
 static void ToggleTimer(HWND hwnd, int index) {
     if (g_cards[index].timerStart != 0) {
-        g_cards[index].sessionAccumulated += (NowMs() - g_cards[index].timerStart);
-        g_cards[index].timerStart = 0;
+        PauseCardTimer(index);
         if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     } else {
-        LONGLONG now = NowMs();
-        for (size_t i = 0; i < g_cards.size(); ++i) {
-            if (static_cast<int>(i) == index || g_cards[i].timerStart == 0) continue;
-            g_cards[i].sessionAccumulated += (now - g_cards[i].timerStart);
-            g_cards[i].timerStart = 0;
+        if (g_cards[index].column != 0) {
+            MessageBoxW(hwnd,
+                L"Stopwatches only count up on cards in the Todo column.\n"
+                L"Move this card back to Todo to run its stopwatch.",
+                L"Stopwatch", MB_OK | MB_ICONINFORMATION);
+            return;
         }
-        g_cards[index].timerStart = now;
+        for (size_t i = 0; i < g_cards.size(); ++i)
+            if (static_cast<int>(i) != index && g_cards[i].timerStart != 0) PauseCardTimer((int)i);
+        g_cards[index].timerStart = NowMs();
         StartLiveTimer(hwnd);
     }
     SaveCards(); FocusCard(hwnd, index); // Acting on a card pulls the focus box onto it.
@@ -1386,12 +1397,20 @@ static void ToggleBlocked(HWND hwnd, int index) {
     SaveCards(); FocusCard(hwnd, index); // Acting on a card pulls the focus box onto it.
 }
 
-// The "New Day" reset: fold every card's live countup (running or paused,
-// including countups carried over from earlier launches) into its accumulated
-// total, stop all running stopwatches, and stamp the reset date so the automatic
-// launch variant does not run twice the same day. The reset is not undoable; the
-// user restarts any stopwatch they want running afterwards.
-static void NewDayReset(HWND hwnd) {
+// The total countup waiting to be folded into the cards' totals, i.e. what
+// "Reset Time" is about to push (running stretches included).
+static LONGLONG PendingCountupMs() {
+    LONGLONG total = 0;
+    for (const auto& c : g_cards) total += c.sessionAccumulated + SessionElapsedMs(c);
+    return total;
+}
+
+// "Reset Time": the one and only action that pushes time. It folds every card's
+// countup (running or paused, including countups carried over from earlier
+// launches) into its accumulated total and stops the running stopwatch; the user
+// restarts anything they want running afterwards. Nothing else folds on its own,
+// so the countups simply carry across a close and reopen until the user asks.
+static void ResetTime(HWND hwnd) {
     LONGLONG now = NowMs();
     bool reset = false;
     for (auto& c : g_cards) {
@@ -1401,8 +1420,6 @@ static void NewDayReset(HWND hwnd) {
         c.timerStart = 0;
         reset = true;
     }
-    g_settings.lastReset = TodayDate();
-    SaveSettings();
     SaveCards();
     StopLiveTimer(hwnd);
     if (reset) InvalidateRect(hwnd, nullptr, FALSE);
@@ -1438,11 +1455,15 @@ static void SelectStep(HWND hwnd, int delta) {
 }
 
 // Move the selected card one column left (-1) or right (+1); it stays selected afterwards.
+// Only the Todo column runs stopwatches, so a card that leaves it also has its
+// stopwatch paused (its countup is kept for the next "Reset Time").
 static void MoveSelectedColumn(HWND hwnd, int delta) {
     if (g_selected < 0 || g_selected >= (int)g_cards.size()) return;
     int column = g_cards[g_selected].column + delta;
     if (column < 0 || column > 2) return; // Already in the first/last column.
     g_cards[g_selected].column = column;
+    if (column != 0) PauseCardTimer(g_selected);
+    if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     SaveCards(); FocusCard(hwnd, g_selected);
 }
 
@@ -1765,7 +1786,7 @@ case WM_KEYDOWN: {
         if (action == HK_REPORT) { ReportBug(hwnd); return 0; }
         if (action == HK_REPORT_PROMPT) { ReportBugWithPrompt(hwnd); return 0; }
         if (action == HK_UPDATE) { UpdateCheck(hwnd); return 0; }
-        if (action == HK_NEW_DAY) { NewDayReset(hwnd); return 0; }
+        if (action == HK_NEW_DAY) { ResetTime(hwnd); return 0; }
         // The remaining actions apply to the card under the last mouse position,
         // or to the keyboard-selected card when the mouse is not over one.
         int hover = ActionIndex(hwnd);
@@ -1810,7 +1831,9 @@ case WM_KEYDOWN: {
             return 0;
         }
         RECT add = AddRect(ColumnRect(client, 0));
-        if (PtInRect(&add, p)) AddCard(hwnd);
+        if (PtInRect(&add, p)) { AddCard(hwnd); return 0; }
+        RECT reset = ResetRect(ColumnRect(client, 1));
+        if (PtInRect(&reset, p)) { ResetTime(hwnd); return 0; }
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -1826,6 +1849,10 @@ case WM_KEYDOWN: {
             RECT client{}; GetClientRect(hwnd, &client);
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             for (int c = 0; c < 3; ++c) { RECT r = ColumnRect(client, c); if (PtInRect(&r, p)) g_cards[g_dragIndex].column = c; }
+            // Only the Todo column runs stopwatches, so dropping a card anywhere
+            // else pauses it and keeps its countup for the next "Reset Time".
+            if (g_cards[g_dragIndex].column != 0) PauseCardTimer(g_dragIndex);
+            if (!AnyTimerRunning()) StopLiveTimer(hwnd);
             g_dragIndex = -1; ReleaseCapture(); SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -1850,7 +1877,7 @@ case WM_KEYDOWN: {
                 { L"Report with Prompt...",  reportPromptHint.c_str() },
                 { L"Check for Updates",      updateHint.c_str()       },
                 { autoUpdateLabel.c_str(),   autoUpdateHint.c_str()   },
-                { L"New Day (reset countups)", newDayHint.c_str()     },
+                { L"Reset Time (push countups to totals)", newDayHint.c_str() },
                 { L"Reload Hotkeys",         L"(re-reads the file)"   },
             };
             const int globalCmds[] = { CMD_REPORT, CMD_REPORT_PROMPT, CMD_UPDATE, CMD_AUTO_UPDATE, CMD_NEW_DAY, CMD_RELOAD_HOTKEYS };
@@ -1866,7 +1893,7 @@ case WM_KEYDOWN: {
                 g_settings.autoUpdate = !g_settings.autoUpdate;
                 SaveSettings();
             }
-            else if (cmd == CMD_NEW_DAY) NewDayReset(hwnd);
+            else if (cmd == CMD_NEW_DAY) ResetTime(hwnd);
             else if (cmd == CMD_RELOAD_HOTKEYS) {
                 LoadHotkeys(); InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -2012,6 +2039,16 @@ case WM_KEYDOWN: {
                 std::wstring addLabel = L"+ Add a card " + HotkeyHint(HK_ADD);
                 DrawTextW(mem, addLabel.c_str(), -1, &add, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
+            if (c == 1) {
+                // "Reset Time": the button that pushes the countups into the totals,
+                // labeled with the amount it is about to fold in.
+                RECT reset = ResetRect(col); Fill(mem, reset, RGB(42,42,42));
+                std::wstring resetLabel = L"Reset Time " + HotkeyHint(HK_NEW_DAY);
+                LONGLONG pending = PendingCountupMs();
+                if (pending >= 1000) resetLabel += L"  +" + FormatTimer(pending) + L" to totals";
+                SetTextColor(mem, RGB(190,190,190));
+                DrawTextW(mem, resetLabel.c_str(), -1, &reset, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
         }
         // Draw cards that are not currently being dragged.
         auto rects = CardRects(client);
@@ -2043,7 +2080,7 @@ case WM_KEYDOWN: {
             // Timer row (below task text): total time left-justified in gray,
             // live countup right-justified in green with a "+". The countup shows
             // while running and stays frozen on the last value when paused; it is
-            // persisted and only cleared by a "New Day" reset.
+            // persisted and only cleared by a "Reset Time".
             RECT lower = r; lower.left += 12; lower.right -= 12; lower.top = r.top + 30; lower.bottom = r.bottom;
             if (g_cards[index].timerAccumulated > 0) {
                 SelectObject(mem, g_font); SetTextColor(mem, RGB(140, 140, 140));
@@ -2129,9 +2166,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         CW_USEDEFAULT, CW_USEDEFAULT, 920, 520, nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
     SetDarkTitleBar(hwnd);
-    // Automatic "New Day": at launch, fold and reset the countups when the last
-    // reset was not today ("" on first run means it applies too).
-    if (g_settings.lastReset != TodayDate()) NewDayReset(hwnd);
     ShowWindow(hwnd, show); // Make the window visible.
     UpdateWindow(hwnd); // Ask Windows to send WM_PAINT immediately.
     PostMessageW(hwnd, WM_APP_UPDATE_CHECK, 0, 0);

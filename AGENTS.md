@@ -46,7 +46,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Data Structures & Globals (lines 14–50)
 
-- `Card` — struct: `{ std::wstring text; int column; bool blocked; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `timerAccumulated` is the total lifetime time (folded in at load and by "New Day" resets); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "New Day" reset; `timerStart` is a QPC timestamp when running (0 = stopped).
+- `Card` — struct: `{ std::wstring text; int column; bool blocked; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `timerAccumulated` is the total lifetime time (only a "Reset Time" folds a countup into it); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "Reset Time"; `timerStart` is a QPC timestamp when running (0 = stopped). Only cards in the Todo column (0) may run a stopwatch.
 - `g_cards` — `vector<Card>`, the entire board state in memory.
 - `g_font` / `g_boldFont` — Segoe UI 16pt normal/semibold, created at startup.
 - `g_dragIndex` — index of card being dragged (-1 = none).
@@ -98,7 +98,6 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `FormatTimer(ms)` — formats to `ss`, `m:ss`, or `h:mm:ss` depending on magnitude.
 - `StartLiveTimer(HWND)` / `StopLiveTimer(HWND)` — manage the 100ms `WM_TIMER` tick.
 - `NowMs()` — current time in milliseconds via QPC.
-- `TodayDate()` — today's local date as `YYYY-MM-DD` for `settings.json` `last_reset`.
 - `StopAllTimers()` — finalizes all running card timers into `sessionAccumulated` (currently unused).
 - `AnyTimerRunning()` — true if any card has a live timer.
 - `RunningTimerIndex()` — index of the card whose stopwatch is running, or -1 when none is.
@@ -111,13 +110,15 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Card Action Helpers (lines ~540–558)
 
-- `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time).
+- `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time). Only cards in the **Todo** column may count up; starting elsewhere shows a message box and changes nothing.
 - `ToggleBlocked(HWND, index)` — shared blocked-flag toggle (used by Ctrl+click, `B` key, and menu).
-- `NewDayReset(HWND)` — the "New Day" reset: folds every card's countup (running or paused, including ones carried over from earlier launches) into its `timerAccumulated`, stops all running stopwatches, stamps `settings.json` `last_reset` with today's date, and saves. Triggered by the menu item, the `new_day` hotkey, and automatically at launch when the recorded date is not today. Not undoable.
+- `PauseCardTimer(int index)` — ends a card's run, freezing its in-flight stretch into `sessionAccumulated`. The single place a run stops other than by choice: the pause toggle, switching the run to another card, and a card leaving the Todo column (drag-drop and Left/Right).
+- `PendingCountupMs()` — total countup waiting to be pushed (all cards, running stretches included); the amount the "Reset Time" button displays.
+- `ResetTime(HWND)` — the "Reset Time" action, the *only* thing that pushes time: folds every card's countup (running or paused, including ones carried over from earlier launches) into its `timerAccumulated`, stops all running stopwatches, and saves. Triggered by the In-Progress column button, the `new_day` hotkey (**Ctrl+Y**), and the global context menu. Nothing folds automatically at launch, so countups survive a close and reopen untouched. Not undoable.
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
 - `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom).
 - `SelectStep(HWND, delta)` — moves the focus box one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
-- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box.
+- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box, and a card that leaves Todo has its stopwatch paused.
 - `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the focused card.
 - `FixSelectionAfterErase(HWND, int)` — keeps `g_selected` on the same card after a deletion shifts the vector, hiding the box when the focused card is the one that went away.
 - `DeleteCard(HWND, index)` — shared delete path (used by the `Delete`/`D` key and the context menu): asks for confirmation first, then erases, fixes the selection, saves and redraws. See the Delete Confirmation Dialog below.
@@ -127,6 +128,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `Fill(HDC, RECT, COLORREF)` — fills a rectangle with a solid color brush.
 - `ColumnRect(RECT client, int column)` — computes the screen rectangle for a column. Layout: 16px margin, 10px gap, 16px top offset.
 - `AddRect(RECT col)` — the "Add a card" clickable area at the bottom of column 0.
+- `ResetRect(RECT col)` — the "Reset Time" clickable area at the bottom of column 1 (In-Progress).
 - `SetDarkTitleBar(HWND)` — dynamically loads `dwmapi.dll` to enable dark title bar (DWMWA_USE_IMMERSIVE_DARK_MODE). Graceful fallback on older Windows.
 - `CardRects(RECT client)` — returns all card screen rectangles (60px height, 66px spacing). Each card fits 10px inset from column edges.
 
@@ -176,11 +178,11 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 Handles all main board interactions:
 
-- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Ctrl+Y** New Day reset, **Up/Down** select a card with the focus box, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
-- **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card.
+- **WM_KEYDOWN** — **F1** (a fixed, non-rebindable key) opens the in-app help page listing the columns, the card interactions, and every *configured* shortcut. Every other keyboard action routes through `HotkeyAction`, i.e. the bindings loaded from `hotkeys.json` (defaults: **Ctrl+N** add, **Ctrl+R** structured bug report, **Ctrl+Shift+R** free-form prompt, **Ctrl+U** update check, **Ctrl+Y** Reset Time, **Up/Down** select a card with the focus box, **Left/Right** move the selected card, and for the card under `g_lastMouse` or the selected card: **Space** edit, **Delete / D** delete, **S** toggle stopwatch, **T** edit timer, **B** toggle blocked). Rebinding an action in the file changes the whole board at once.
+- **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card; click on the "Reset Time" button in In-Progress pushes every countup into its total.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active.
-- **WM_LBUTTONUP** — drops card into whichever column the mouse is over.
-- **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, **New Day (reset countups)**, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
+- **WM_LBUTTONUP** — drops card into whichever column the mouse is over, pausing its stopwatch if it left the Todo column.
+- **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, **Reset Time (push countups to totals)**, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
 - **WM_MEASUREITEM** / **WM_DRAWITEM** — owner-drawn popup menu sizing/painting: black bg RGB(27,27,27), white label, gray right-aligned key hint, hover highlight RGB(70,70,70).
 - **WM_CAPTURECHANGED** — cancels drag if capture lost.
 - **WM_TIMER** — 100ms live tick: invalidates the window while any stopwatch is running; kills the timer when none are. `TIMER_FOCUS` is the 1s focus-idle tick (`FocusIdleTimeout`).
@@ -188,13 +190,14 @@ Handles all main board interactions:
 - **WM_ERASEBKGND** — returns 1 (all painting happens in WM_PAINT).
 - **WM_PAINT** — double-buffered painting:
   - Background RGB(27,27,27), column backgrounds RGB(39,39,39), headers RGB(43,43,43).
+  - Column buttons: "+ Add a card (ctrl+n)" in Todo and "Reset Time (ctrl+y)" (plus the total it will push, when any) in In-Progress, both on RGB(42,42,42).
   - Cards RGB(50,50,50). **Blocked** cards get a thick red (RGB(220,50,50)) 3px outline. **Running-timer** cards get a thick green (RGB(50,180,50)) 3px outline. The **focused** card gets a black (RGB(0,0,0)) 3px outline, so the box reads as a subtle marker instead of a highlight. Blocked and running take drawing priority over the focus outline.
-  - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live countup** right-justified in green (RGB(50,180,50)) with a `+` prefix. The countup shows while running and stays frozen on the last value when paused; it is persisted (`session_ms`) and only cleared by a "New Day" reset.
+  - Task text in top ~30px of card. Timer row in the bottom ~30px: **total** time left-justified in gray (RGB(140,140,140)), plus the **live countup** right-justified in green (RGB(50,180,50)) with a `+` prefix. The countup shows while running and stays frozen on the last value when paused; it is persisted (`session_ms`) and only cleared by a "Reset Time".
 - **WM_DESTROY** — stops the live and focus timers, saves (the countup is persisted in `session_ms`, so it restores stopped with the `+` display intact), frees fonts, posts quit.
 
 ### Entry Point (lines ~790–830)
 
-- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt, delete confirmation), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs the automatic "New Day" reset if the last reset was not today, runs message loop.
+- `wWinMain()` — initializes COM, queries QPC frequency, creates fonts, registers window classes (main, input, time input, report prompt, delete confirmation), loads cards, settings and hotkeys, creates main window (920×520), enables dark title bar, runs message loop. No time is folded at launch: countups are only pushed by "Reset Time".
 
 ### Networking & Self-Updates (GitHub integration)
 
@@ -226,8 +229,8 @@ All network use is on-demand — there are no threads, timers, or persistent con
 - `column`: integer 0, 1, or 2
 - `text`: UTF-8 string with JSON escaping
 - `blocked`: true/false (optional, defaults false)
-- `timer_ms`: accumulated stopwatch time in milliseconds (optional, defaults 0); grows on "New Day" resets
-- `session_ms`: the live countup ("+" display) in milliseconds (optional, defaults 0); cleared by a "New Day" reset
+- `timer_ms`: accumulated stopwatch time in milliseconds (optional, defaults 0); grows when "Reset Time" pushes a countup
+- `session_ms`: the live countup ("+" display) in milliseconds (optional, defaults 0); cleared by a "Reset Time"
 
 `%LOCALAPPDATA%\MinimalKanban\hotkeys.json` (written once with the defaults on first run, then
 never rewritten by the app — edit it and reload via the right-click menu or restart):
@@ -260,15 +263,17 @@ never rewritten by the app — edit it and reload via the right-click menu or re
   malformed lines, unknown key names, and duplicate entries are silently ignored (default kept), and
   a missing file just writes the defaults.
 - `Reload Hotkeys` (right-click empty board space) re-reads the file without restarting; the menu and
-  Add-button hints always reflect the currently configured bindings.
+  button hints always reflect the currently configured bindings.
+- `new_day` is the historical key name for the action now labelled "Reset Time"; it is kept as-is so
+  `hotkeys.json` files written by earlier builds keep working without edits.
 
 ## Card Interactions
 
 | Action | Mouse | Keyboard |
 |--------|-------|----------|
 | Select a card | Hover the pointer over it | **Up** / **Down** (focus box) |
-| Move card between columns | Drag (plain click) | **Left** / **Right** on the selected card |
-| Toggle stopwatch start/stop (starts a running stopwatch on the other card) | Shift+left-click | **S** |
+| Move card between columns (leaving Todo pauses the stopwatch) | Drag (plain click) | **Left** / **Right** on the selected card |
+| Toggle stopwatch start/stop on a Todo card (starts a running stopwatch on the other card) | Shift+left-click | **S** |
 | Toggle blocked flag (red outline) | Ctrl+left-click | **B** |
 | Edit card text | Right-click → Edit | **Space** |
 | Delete card (asks for confirmation first) | Right-click → Delete | **Delete** or **D** |
@@ -277,14 +282,18 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 | File a bug report (opens browser) | Right-click empty space → Report a Bug | **Ctrl+R** |
 | File a report in your own words (opens browser) | Right-click empty space → Report with Prompt... | **Ctrl+Shift+R** |
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
-| New Day: fold every countup into its total and reset the board | Right-click empty space → New Day (reset countups) | **Ctrl+Y** (also runs automatically at launch when the last reset was not today) |
+| Reset Time: fold every countup into its total and stop the stopwatch | Right-click empty space → Reset Time (push countups to totals), or click "Reset Time" at the bottom of In-Progress | **Ctrl+Y** |
 
 Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The focused card is outlined in black, and the red (blocked) and green (running) outlines take visual priority.
 
 The **focus box** is a black 3px outline and follows the user: it lands on the card the arrow keys picked, on a newly created card, and on any card an action ran against (stopwatch, blocked, edit, edit timer). After `FOCUS_IDLE_MS` (10s) without focus activity it falls back to the card with the running stopwatch, or disappears when no stopwatch is running, so an untouched box never sits drawing attention to a random card.
 
 Every keyboard shortcut above is a **default** editable in `hotkeys.json` (see Data Format); the keys
-shown in the menus and on the "+ Add a card" button always reflect the current bindings.
+shown in the menus and on the "+ Add a card" and "Reset Time" buttons always reflect the current bindings.
+
+Stopwatches only count up in the **Todo** column: starting one elsewhere (Shift+click, **S**, or the
+card menu) says so and changes nothing, and a card dragged or keyed out of Todo has its stopwatch
+paused with the countup kept for the next "Reset Time".
 
 ## Dialog Interactions
 
