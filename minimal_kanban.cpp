@@ -73,6 +73,12 @@ static std::vector<Hotkey> g_hotkeys[HK_COUNT];
 static LARGE_INTEGER g_qpcFreq{};        // QPC frequency, queried once at startup.
 static UINT_PTR g_liveTimerID = 0;       // Win32 timer ID for live stopwatch updates (0 = not running).
 static HWND g_helpHwnd = nullptr;        // Handle of the F1 help window (0 = closed).
+// Cached double-buffer used by WM_PAINT. Allocating a full-window bitmap on
+// every paint made the process footprint grow (the live stopwatch repaints ten
+// times a second), so the buffer is kept and only rebuilt when the size changes.
+static HDC g_backDC = nullptr;
+static HBITMAP g_backBitmap = nullptr;
+static int g_backW = 0, g_backH = 0;
 static Settings g_settings;
 static volatile LONG g_updateBusy = 0;
 static volatile LONG g_updateCancelled = 0;
@@ -595,6 +601,35 @@ static void Fill(HDC dc, const RECT& r, COLORREF color) {
     HBRUSH b = CreateSolidBrush(color);
     FillRect(dc, &r, b);
     DeleteObject(b);
+}
+
+// Free the cached double-buffer. Called when the window is destroyed, and
+// whenever the buffer has to be rebuilt for a new client size. The DC is
+// deleted first so the bitmap is no longer selected into it and can be freed.
+static void ReleaseBackBuffer() {
+    if (g_backDC) { DeleteDC(g_backDC); g_backDC = nullptr; }
+    if (g_backBitmap) { DeleteObject(g_backBitmap); g_backBitmap = nullptr; }
+    g_backW = 0; g_backH = 0;
+}
+
+// Return the cached double-buffer sized w x h, creating it on first use and
+// recreating it only when the client area changes. Reusing one buffer across
+// paints is what keeps the process footprint flat: the board repaints ten times
+// a second while a stopwatch runs, and a fresh full-window bitmap per repaint
+// left the working set growing without bound. A minimized window reports a
+// zero-size client, which has nothing to draw, so it gets no buffer.
+static HDC BackBuffer(HDC dc, int w, int h) {
+    if (w <= 0 || h <= 0) return nullptr;
+    if (g_backDC && (g_backW != w || g_backH != h)) ReleaseBackBuffer();
+    if (!g_backDC) {
+        g_backDC = CreateCompatibleDC(dc);
+        if (!g_backDC) return nullptr;
+        g_backBitmap = CreateCompatibleBitmap(dc, w, h);
+        if (!g_backBitmap) { ReleaseBackBuffer(); return nullptr; }
+        SelectObject(g_backDC, g_backBitmap); // The stock 1x1 mono bitmap goes with the DC.
+        g_backW = w; g_backH = h;
+    }
+    return g_backDC;
 }
 
 // Calculate the screen rectangle occupied by one of the three columns.
@@ -1838,9 +1873,10 @@ case WM_KEYDOWN: {
         if (mi->CtlType == ODT_MENU) {
             MenuItemData* data = (MenuItemData*)mi->itemData;
             HDC dc = GetDC(hwnd);
-            SelectObject(dc, g_font);
+            HGDIOBJ oldFont = SelectObject(dc, g_font);
             SIZE s{}; GetTextExtentPoint32W(dc, data->text, (int)wcslen(data->text), &s);
             SIZE hint{}; GetTextExtentPoint32W(dc, data->hint, (int)wcslen(data->hint), &hint);
+            SelectObject(dc, oldFont); // Put the window DC's own font back before releasing it.
             ReleaseDC(hwnd, dc);
             // 12px left padding + 16px gap between label and hint + 12px right padding.
             mi->itemWidth = s.cx + hint.cx + 40;
@@ -1897,13 +1933,12 @@ case WM_KEYDOWN: {
     case WM_SIZE: InvalidateRect(hwnd, nullptr, FALSE); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
-        // Draw the entire board into an off-screen bitmap, then copy it to the window.
-        // This double buffering prevents visible flicker during redraws.
+        // Draw the entire board into the cached off-screen buffer, then copy it to
+        // the window. This double buffering prevents visible flicker during redraws.
         PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps);
         RECT client{}; GetClientRect(hwnd, &client);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
-        HGDIOBJ oldBitmap = SelectObject(mem, bitmap);
+        HDC mem = BackBuffer(dc, client.right, client.bottom);
+        if (!mem) { EndPaint(hwnd, &ps); return 1; }
         SetBkMode(mem, TRANSPARENT);
         Fill(mem, client, RGB(27,27,27));
         // Draw the three columns, their headers, card counts, and the Add button.
@@ -1978,12 +2013,13 @@ case WM_KEYDOWN: {
         SelectObject(mem, penOld); SelectObject(mem, brOld);
         DeleteObject(penBlocked); DeleteObject(penTimer); DeleteObject(penSelected);
         BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, oldBitmap); DeleteObject(bitmap); DeleteDC(mem); EndPaint(hwnd, &ps); return 0;
+        EndPaint(hwnd, &ps); return 0;
     }
     case WM_DESTROY:
-        // Save before closing, release GDI font objects, and end the message loop.
+        // Save before closing, release GDI objects, and end the message loop.
         InterlockedExchange(&g_updateCancelled, 1);
         StopLiveTimer(hwnd);
+        ReleaseBackBuffer();
         SaveCards(); if (g_font) DeleteObject(g_font); if (g_boldFont) DeleteObject(g_boldFont); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
