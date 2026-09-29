@@ -60,7 +60,7 @@ static const wchar_t* HELP_CLASS = L"MinimalKanbanHelp"; // Name of the F1 help 
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
-static const wchar_t* APP_VERSION = L"0.1.9";
+static const wchar_t* APP_VERSION = L"0.1.10";
 // Names of the rebindable actions, used both as hotkeys.json keys and when
 // matching a pressed key back to its action.
 static const wchar_t* HK_NAMES[HK_COUNT] = {
