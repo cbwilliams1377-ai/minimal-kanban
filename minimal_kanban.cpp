@@ -21,6 +21,7 @@ struct Card {
     std::wstring text;
     int column;
     bool blocked = false;
+    std::wstring blockerNote; // Short description of the blocker; shown only while blocked.
     LONGLONG timerAccumulated = 0; // completed time from runs before this program run
     LONGLONG sessionAccumulated = 0; // paused countup time; persisted and cleared by a "Reset Time"
     LONGLONG timerStart = 0;       // QPC timestamp when running (0 = stopped)
@@ -36,7 +37,7 @@ struct Settings {
 // matches an action when modifiers and virtual key are all identical.
 enum {
     HK_ADD = 0, HK_EDIT, HK_DELETE, HK_TOGGLE_TIMER, HK_EDIT_TIMER, HK_BLOCKED,
-    HK_SELECT_UP, HK_SELECT_DOWN, HK_MOVE_LEFT, HK_MOVE_RIGHT,
+    HK_SELECT_UP, HK_SELECT_DOWN, HK_SELECT_LEFT, HK_SELECT_RIGHT, HK_MOVE_LEFT, HK_MOVE_RIGHT,
     HK_REPORT, HK_REPORT_PROMPT, HK_UPDATE, HK_NEW_DAY, HK_COUNT
 };
 
@@ -48,6 +49,8 @@ static std::vector<Card> g_cards; // All cards currently loaded in memory.
 static HFONT g_font = nullptr, g_boldFont = nullptr; // Fonts used while drawing text.
 static int g_dragIndex = -1; // Index of the card being dragged; -1 means no drag is active.
 static POINT g_dragPoint{}; // Current mouse position while dragging a card.
+static POINT g_dragOrigin{}; // Where the current drag was started, to tell a drag from a click.
+static bool g_dragMoved = false; // True once the drag moved past DRAG_THRESHOLD.
 static POINT g_lastMouse{}; // Last known mouse position, used for hover-based keyboard actions.
 static int g_selected = -1; // Index of the card the focus box is on; -1 means the box is hidden.
 static LONGLONG g_focusAt = 0; // When the focus box last moved (QPC ms); 0 = no idle countdown pending.
@@ -67,7 +70,8 @@ static const wchar_t* APP_VERSION = L"0.1.12";
 // written by earlier builds keep working untouched.
 static const wchar_t* HK_NAMES[HK_COUNT] = {
     L"add", L"edit", L"delete", L"toggle_timer", L"edit_timer", L"blocked",
-    L"select_up", L"select_down", L"move_left", L"move_right",
+    L"select_up", L"select_down", L"select_left", L"select_right",
+    L"move_left", L"move_right",
     L"report", L"report_prompt", L"update", L"new_day"
 };
 // The current binding set, loaded from hotkeys.json at startup or on "Reload Hotkeys".
@@ -91,6 +95,8 @@ static volatile LONG g_updateCancelled = 0;
 #define FOCUS_IDLE_MS 10000              // Idle time before the focus box falls back to the running stopwatch.
 #define CARD_HEIGHT 60                   // Height of each card in pixels.
 #define CARD_SPACING 66                  // Vertical spacing between cards.
+#define DRAG_THRESHOLD 4                 // Pointer travel (px) that makes a click a drag.
+#define BLOCKER_NOTE_MAX 60              // Max characters accepted for a blocker description.
 #define WM_APP_UPDATE_CHECK (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT (WM_APP + 2)
 
@@ -319,6 +325,31 @@ static std::wstring JsonStringField(const std::string& json, const char* key) {
     return Wide(json.substr(q1 + 1, q2 - q1 - 1));
 }
 
+// Read one quoted, escaped string field out of a saved card line (the card text and
+// the blocker description), skipping quotes that a backslash has escaped. Returns
+// false when the key is absent or its value is malformed, leaving out untouched.
+static bool JsonEscapedField(const std::string& line, const char* key, std::wstring& out) {
+    std::string quoted = std::string("\"") + key + "\"";
+    size_t p = line.find(quoted);
+    if (p == std::string::npos) return false;
+    size_t colon = line.find(':', p + quoted.size());
+    if (colon == std::string::npos) return false;
+    size_t q1 = line.find('"', colon + 1);
+    if (q1 == std::string::npos) return false;
+    std::string encoded;
+    bool escaped = false;
+    size_t q2 = q1 + 1;
+    // Find the closing quote, skipping quotes that are escaped with a backslash.
+    for (; q2 < line.size(); ++q2) {
+        char c = line[q2];
+        if (!escaped && c == '"') break;
+        encoded += c;
+        if (!escaped && c == '\\') escaped = true; else escaped = false;
+    }
+    out = Wide(JsonUnescape(encoded));
+    return true;
+}
+
 // Write every card to the board.json file.
 // Timers are NOT stopped here: "timer_ms" is the accumulated total and
 // "session_ms" is the live countup (paused stretches plus any in-flight run),
@@ -334,6 +365,7 @@ static void SaveCards() {
         f << "    {\"column\": " << g_cards[i].column
           << ", \"text\": \"" << JsonEscape(Utf8(g_cards[i].text)) << "\""
           << ", \"blocked\": " << (g_cards[i].blocked ? "true" : "false")
+          << ", \"blocker_note\": \"" << JsonEscape(Utf8(g_cards[i].blockerNote)) << "\""
           << ", \"timer_ms\": " << g_cards[i].timerAccumulated
           << ", \"session_ms\": " << (g_cards[i].sessionAccumulated + SessionElapsedMs(g_cards[i]))
           << "}";
@@ -350,26 +382,17 @@ static void LoadCards() {
     std::string line;
     while (std::getline(f, line)) { // SaveCards writes one card per line.
         size_t cp = line.find("\"column\"");
-        size_t tp = line.find("\"text\"");
-        if (cp == std::string::npos || tp == std::string::npos) continue;
+        if (cp == std::string::npos) continue;
         size_t colon = line.find(':', cp), comma = line.find(',', colon);
         int column = 0;
         // Ignore malformed lines rather than allowing a damaged save file to crash the app.
         try { column = std::stoi(line.substr(colon + 1, comma - colon - 1)); } catch (...) { continue; }
-        size_t q1 = line.find('"', line.find(':', tp) + 1);
-        if (q1 == std::string::npos) continue;
-        std::string encoded;
-        bool escaped = false;
-        size_t q2 = q1 + 1;
-        // Find the closing quote, skipping quotes that are escaped with a backslash.
-        for (; q2 < line.size(); ++q2) {
-            char c = line[q2];
-            if (!escaped && c == '"') break;
-            encoded += c;
-            if (!escaped && c == '\\') escaped = true; else escaped = false;
-        }
         if (column < 0 || column > 2) continue;
-        Card card{Wide(JsonUnescape(encoded)), column};
+        Card card;
+        card.column = column;
+        if (!JsonEscapedField(line, "text", card.text)) continue;
+        // Parse optional "blocker_note" field (the blocker description, default empty).
+        JsonEscapedField(line, "blocker_note", card.blockerNote);
         // Parse optional "blocked" field (default false for backward compatibility).
         size_t bp = line.find("\"blocked\"");
         if (bp != std::string::npos) {
@@ -435,8 +458,12 @@ static void ResetHotkeysToDefaults() {
     g_hotkeys[HK_BLOCKED]       = { { 0, 'B' } };
     g_hotkeys[HK_SELECT_UP]     = { { 0, VK_UP } };
     g_hotkeys[HK_SELECT_DOWN]   = { { 0, VK_DOWN } };
-    g_hotkeys[HK_MOVE_LEFT]     = { { 0, VK_LEFT } };
-    g_hotkeys[HK_MOVE_RIGHT]    = { { 0, VK_RIGHT } };
+    // Left/Right only move the focus box between columns; moving the card itself
+    // waits for the Ctrl+Arrow chord, so an arrow press never changes the board.
+    g_hotkeys[HK_SELECT_LEFT]   = { { 0, VK_LEFT } };
+    g_hotkeys[HK_SELECT_RIGHT]  = { { 0, VK_RIGHT } };
+    g_hotkeys[HK_MOVE_LEFT]     = { { MOD_CONTROL, VK_LEFT } };
+    g_hotkeys[HK_MOVE_RIGHT]    = { { MOD_CONTROL, VK_RIGHT } };
     g_hotkeys[HK_REPORT]        = { { MOD_CONTROL, 'R' } };
     g_hotkeys[HK_REPORT_PROMPT] = { { MOD_CONTROL | MOD_SHIFT, 'R' } };
     g_hotkeys[HK_UPDATE]        = { { MOD_CONTROL, 'U' } };
@@ -732,6 +759,7 @@ static std::wstring BuildHelpText() {
     t += L"  Green +time - the current stopwatch countup (running or paused; survives restarts, cleared by Reset Time)\r\n";
     t += L"    A stopwatch only counts up on a card in the Todo column, and moving a card out of Todo pauses it\r\n";
     t += L"  Red outline - the card is blocked\r\n";
+    t += L"  Red note on the right - what is blocking a blocked card\r\n";
     t += L"  Green outline - the stopwatch is running on this card\r\n";
     t += L"  Black outline - the focus box: the card the arrow keys picked, or the card you last acted on\r\n";
     t += L"    After 10 idle seconds it returns to the card with the running stopwatch, or goes away when none runs\r\n";
@@ -741,7 +769,8 @@ static std::wstring BuildHelpText() {
     t += L"  Click \"Reset Time\" at the bottom of In-Progress - push every countup into its card's total\r\n";
     t += L"  Drag a card - move it to another column (leaving Todo pauses its stopwatch)\r\n";
     t += L"  Shift+click a card - start/stop its stopwatch (Todo cards only)\r\n";
-    t += L"  Ctrl+click a card - toggle its blocked flag\r\n";
+    t += L"  Double-click a card - start/stop its stopwatch (Todo cards only)\r\n";
+    t += L"  Ctrl+click a card - block or unblock it (blocking asks for a description)\r\n";
     t += L"  Right-click a card - edit, delete or set its timer\r\n";
     t += L"  Right-click empty board space - reports, updates, reload hotkeys\r\n";
     t += L"\r\n";
@@ -752,11 +781,13 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  Delete card (asks to confirm)", HK_DELETE) + L"\r\n";
     t += HelpBindingLine(L"  Toggle stopwatch (Todo cards only)", HK_TOGGLE_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Set stopwatch time manually", HK_EDIT_TIMER) + L"\r\n";
-    t += HelpBindingLine(L"  Toggle blocked flag", HK_BLOCKED) + L"\r\n";
+    t += HelpBindingLine(L"  Toggle blocked flag (blocking asks for a description)", HK_BLOCKED) + L"\r\n";
     t += HelpBindingLine(L"  Select previous card", HK_SELECT_UP) + L"\r\n";
     t += HelpBindingLine(L"  Select next card", HK_SELECT_DOWN) + L"\r\n";
-    t += HelpBindingLine(L"  Move card to the previous column", HK_MOVE_LEFT) + L"\r\n";
-    t += HelpBindingLine(L"  Move card to the next column", HK_MOVE_RIGHT) + L"\r\n";
+    t += HelpBindingLine(L"  Select a card in the previous column", HK_SELECT_LEFT) + L"\r\n";
+    t += HelpBindingLine(L"  Select a card in the next column", HK_SELECT_RIGHT) + L"\r\n";
+    t += HelpBindingLine(L"  Move card to the previous column (Ctrl+Arrow)", HK_MOVE_LEFT) + L"\r\n";
+    t += HelpBindingLine(L"  Move card to the next column (Ctrl+Arrow)", HK_MOVE_RIGHT) + L"\r\n";
     t += HelpBindingLine(L"  File a bug report", HK_REPORT) + L"\r\n";
     t += HelpBindingLine(L"  File a report in your own words", HK_REPORT_PROMPT) + L"\r\n";
     t += HelpBindingLine(L"  Check for updates", HK_UPDATE) + L"\r\n";
@@ -765,13 +796,15 @@ static std::wstring BuildHelpText() {
     t += L"Keyboard card actions apply to the card under the mouse, falling back\r\n";
     t += L"to the focused card when the pointer is not over one. Acting on a card\r\n";
     t += L"(stopwatch, blocked, edit) moves the focus box onto it, and so does adding\r\n";
-    t += L"a card.\r\n";
+    t += L"a card. Left/Right walk the focus box across columns; Ctrl+Left/Ctrl+Right\r\n";
+    t += L"are what actually move a card to the neighbouring column.\r\n";
     t += L"\r\n";
     t += L"Dialogs:\r\n";
-    t += L"  Enter / Esc - accept or dismiss the add-card and set-timer dialogs\r\n";
+    t += L"  Enter / Esc - accept or dismiss the add-card, blocker and set-timer dialogs\r\n";
     t += L"  Ctrl+Backspace - delete the previous word in a text box\r\n";
     t += L"  Ctrl+Enter - submit the \"Report with your own words\" dialog\r\n";
     t += L"  Deleting a card always asks first: Enter deletes, Esc or Backspace keeps it\r\n";
+    t += L"  The blocker description is optional: leaving it blank still blocks the card\r\n";
     t += L"\r\n";
     t += L"The shortcuts above are configured in hotkeys.json next to the app.\r\n";
     t += L"Edit that file and choose \"Reload Hotkeys\" (right-click empty board\r\n";
@@ -916,18 +949,35 @@ static void PumpDialog(HWND dlg, HWND edit, bool* done, bool ctrlEnterSubmits) {
 
 // State used while the add-card window is open.
 // The main window waits until done becomes true, then checks accepted and text.
-struct InputState { HWND edit = nullptr; bool done = false; bool accepted = false; std::wstring text; std::wstring initial; };
+struct InputState {
+    HWND edit = nullptr;
+    bool done = false;
+    bool accepted = false;
+    bool allowEmpty = false; // Take a blank box as an answer (the blocker dialog).
+    int limit = 0;            // Max characters in the box (0 = the Windows default).
+    std::wstring text;
+    std::wstring initial;
+    std::wstring okLabel = L"Add"; // Label of the accept button.
+    std::wstring hint;               // Optional one-line label above the text box.
+};
 static InputState* g_input = nullptr;
 
-// Window procedure for the small add-card window.
+// Window procedure for the small text window shared by the add-card and the
+// blocker-description dialogs.
 // Windows calls this function whenever that window receives an event/message.
 static LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
-        // Create the text box and the two buttons as child controls.
+        // Create the optional hint label, the text box and the two buttons.
+        int editTop = 20;
+        if (!g_input->hint.empty()) {
+            CreateWindowW(L"STATIC", g_input->hint.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT,
+                16, 8, 344, 18, hwnd, (HMENU)101, GetModuleHandleW(nullptr), nullptr);
+            editTop = 30;
+        }
         g_input->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            16, 20, 328, 28, hwnd, (HMENU)100, GetModuleHandleW(nullptr), nullptr);
-        HWND addButton = CreateWindowW(L"BUTTON", L"Add", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
+            16, editTop, 328, 28, hwnd, (HMENU)100, GetModuleHandleW(nullptr), nullptr);
+        HWND addButton = CreateWindowW(L"BUTTON", g_input->okLabel.c_str(), WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
             188, 62, 75, 28, hwnd, (HMENU)IDOK, GetModuleHandleW(nullptr), nullptr);
         HWND cancelButton = CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             269, 62, 75, 28, hwnd, (HMENU)IDCANCEL, GetModuleHandleW(nullptr), nullptr);
@@ -945,6 +995,7 @@ static LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(g_input->edit, WM_SETFONT, (WPARAM)g_font, TRUE);
         for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
             SendMessageW(child, WM_SETFONT, (WPARAM)g_font, TRUE);
+        if (g_input->limit > 0) SendMessageW(g_input->edit, EM_SETLIMITTEXT, g_input->limit, 0);
         if (!g_input->initial.empty()) SetWindowTextW(g_input->edit, g_input->initial.c_str());
         SetFocus(g_input->edit); // Put the keyboard cursor in the text box immediately.
         return 0;
@@ -992,12 +1043,11 @@ static LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK) {
-            // IDOK means the Add button was pressed.
-            int n = GetWindowTextLengthW(g_input->edit);
-            std::wstring text(n + 1, L'\0');
-            GetWindowTextW(g_input->edit, text.data(), n + 1);
-            text.resize(n);
-            if (!text.empty()) { g_input->text = text; g_input->accepted = true; }
+            // IDOK means the accept button was pressed.
+            std::wstring text = EditText(g_input->edit);
+            // A blank box is rejected unless the dialog accepts one: the blocker
+            // description is optional, the card text is not.
+            if (g_input->allowEmpty || !text.empty()) { g_input->text = text; g_input->accepted = true; }
             DestroyWindow(hwnd);
             return 0;
         }
@@ -1009,17 +1059,25 @@ static LRESULT CALLBACK InputProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// Show the add-card window and wait until the user accepts or cancels it.
-// If initial is non-empty, the dialog is pre-populated (edit mode).
-static bool AskForCard(HWND owner, std::wstring& out, const std::wstring& initial = L"") {
+// Show the single-line text window and wait until the user accepts or cancels it.
+// title names the window, okLabel its accept button, initial pre-fills the box
+// (edit mode), allowEmpty lets a blank submission stand for "no text", limit caps
+// the box and hint is the optional line shown above it.
+static bool AskForText(HWND owner, std::wstring& out, const wchar_t* title, const wchar_t* okLabel,
+                       const std::wstring& initial = L"", bool allowEmpty = false,
+                       int limit = 0, const wchar_t* hint = nullptr) {
     InputState state;
     state.initial = initial;
+    state.okLabel = okLabel;
+    state.allowEmpty = allowEmpty;
+    state.limit = limit;
+    if (hint) state.hint = hint;
     g_input = &state;
     EnableWindow(owner, FALSE); // Make the main window temporarily non-interactive.
     RECT pr{}; GetWindowRect(owner, &pr);
     int x = pr.left + (pr.right - pr.left - 376) / 2;
     int y = pr.top + (pr.bottom - pr.top - 140) / 2;
-    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, INPUT_CLASS, L"Add a card",
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, INPUT_CLASS, title,
         WS_CAPTION | WS_SYSMENU | WS_VISIBLE, x, y, 376, 140, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!dlg) { EnableWindow(owner, TRUE); g_input = nullptr; return false; }
     SetDarkTitleBar(dlg);
@@ -1028,6 +1086,12 @@ static bool AskForCard(HWND owner, std::wstring& out, const std::wstring& initia
     EnableWindow(owner, TRUE); SetForegroundWindow(owner); g_input = nullptr;
     if (state.accepted) out = state.text;
     return state.accepted;
+}
+
+// Show the add-card window and wait until the user accepts or cancels it.
+// If initial is non-empty, the dialog is pre-populated (edit mode).
+static bool AskForCard(HWND owner, std::wstring& out, const std::wstring& initial = L"") {
+    return AskForText(owner, out, L"Add a card", L"Add", initial);
 }
 
 // Ask for a card, add it to the Todo column, save it, and redraw the board.
@@ -1391,9 +1455,21 @@ static void ToggleTimer(HWND hwnd, int index) {
     SaveCards(); FocusCard(hwnd, index); // Acting on a card pulls the focus box onto it.
 }
 
-// Toggle the blocked flag for a card.
+// Toggle the blocked flag for a card. Blocking a card first asks for a short
+// description of the blocker, which is kept with the card and shown in red on its
+// right-hand side; submitting the dialog blank blocks the card without a note and
+// cancelling changes nothing. Unblocking drops the description with the flag.
 static void ToggleBlocked(HWND hwnd, int index) {
-    g_cards[index].blocked = !g_cards[index].blocked;
+    if (g_cards[index].blocked) {
+        g_cards[index].blocked = false;
+        g_cards[index].blockerNote.clear();
+    } else {
+        std::wstring note;
+        if (!AskForText(hwnd, note, L"Block card", L"Block", L"", true, BLOCKER_NOTE_MAX,
+                        L"What is blocking this card? (optional)")) return;
+        g_cards[index].blocked = true;
+        g_cards[index].blockerNote = Trim(note);
+    }
     SaveCards(); FocusCard(hwnd, index); // Acting on a card pulls the focus box onto it.
 }
 
@@ -1454,7 +1530,31 @@ static void SelectStep(HWND hwnd, int delta) {
     FocusCard(hwnd, order[next]);
 }
 
+// Move the focus box into the neighbouring column (-1 / +1) and onto the card
+// sitting closest to the row the box is already on, so arrowing sideways follows
+// the card the user is looking at instead of jumping to the top. With nothing
+// focused, Left lands on the first card of Todo and Right on the first card of
+// Complete; an empty column or the edge of the board is a no-op. Only the box
+// moves: the cards stay where they are until Ctrl+Arrow moves one.
+static void SelectColumn(HWND hwnd, int delta) {
+    RECT client{}; GetClientRect(hwnd, &client);
+    std::vector<std::pair<int, RECT>> rects = CardRects(client);
+    bool focused = g_selected >= 0 && g_selected < (int)g_cards.size();
+    int column = focused ? g_cards[g_selected].column + delta : (delta > 0 ? 2 : 0);
+    if (column < 0 || column > 2) return; // Already in the first/last column.
+    int top = 0; // The row the box is on; the first row when it is not on screen.
+    if (focused) for (auto [index, r] : rects) if (index == g_selected) { top = (int)r.top; break; }
+    int best = -1, distance = 0;
+    for (auto [index, r] : rects) {
+        if (g_cards[index].column != column) continue;
+        int d = std::abs((int)r.top - top);
+        if (best < 0 || d < distance) { best = index; distance = d; }
+    }
+    if (best >= 0) FocusCard(hwnd, best);
+}
+
 // Move the selected card one column left (-1) or right (+1); it stays selected afterwards.
+// This is the Ctrl+Arrow chord, so a plain arrow press only walks the focus box.
 // Only the Todo column runs stopwatches, so a card that leaves it also has its
 // stopwatch paused (its countup is kept for the next "Reset Time").
 static void MoveSelectedColumn(HWND hwnd, int delta) {
@@ -1782,6 +1882,7 @@ case WM_KEYDOWN: {
         if (action < 0) break;
         if (action == HK_ADD) { AddCard(hwnd); return 0; }
         if (action == HK_SELECT_UP || action == HK_SELECT_DOWN) { SelectStep(hwnd, action == HK_SELECT_DOWN ? 1 : -1); return 0; }
+        if (action == HK_SELECT_LEFT || action == HK_SELECT_RIGHT) { SelectColumn(hwnd, action == HK_SELECT_RIGHT ? 1 : -1); return 0; }
         if (action == HK_MOVE_LEFT || action == HK_MOVE_RIGHT) { MoveSelectedColumn(hwnd, action == HK_MOVE_RIGHT ? 1 : -1); return 0; }
         if (action == HK_REPORT) { ReportBug(hwnd); return 0; }
         if (action == HK_REPORT_PROMPT) { ReportBugWithPrompt(hwnd); return 0; }
@@ -1825,7 +1926,8 @@ case WM_KEYDOWN: {
                 ToggleBlocked(hwnd, hit);
             } else {
                 // Plain click starts dragging the card.
-                g_dragIndex = hit; g_dragPoint = p; SetCapture(hwnd);
+                g_dragIndex = hit; g_dragPoint = p; g_dragOrigin = p; g_dragMoved = false;
+                SetCapture(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
@@ -1836,11 +1938,35 @@ case WM_KEYDOWN: {
         if (PtInRect(&reset, p)) { ResetTime(hwnd); return 0; }
         return 0;
     }
+    case WM_LBUTTONDBLCLK: {
+        // Double-click is the mouse way to start/stop a stopwatch, the same action
+        // the S key performs. Windows sends this message instead of the second
+        // WM_LBUTTONDOWN, so the drag the first press started is already dropped
+        // here: a drag that really moved a card keeps the double-click to itself.
+        POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        g_lastMouse = p;
+        bool moved = g_dragMoved;
+        g_dragMoved = false;
+        // Shift+click and Ctrl+click already have their own meaning on the first
+        // press of the pair, so a double-click with a modifier held does nothing.
+        if (moved || (GetAsyncKeyState(VK_SHIFT) & 0x8000) || (GetAsyncKeyState(VK_CONTROL) & 0x8000)) return 0;
+        RECT client{}; GetClientRect(hwnd, &client);
+        int hit = HoverIndex(client, p);
+        if (hit >= 0) ToggleTimer(hwnd, hit);
+        return 0;
+    }
     case WM_MOUSEMOVE: {
         POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         g_lastMouse = p;
         // While the left button is held, redraw the dragged card at the new position.
-        if (g_dragIndex >= 0 && (wp & MK_LBUTTON)) { g_dragPoint = p; InvalidateRect(hwnd, nullptr, FALSE); }
+        if (g_dragIndex >= 0 && (wp & MK_LBUTTON)) {
+            g_dragPoint = p;
+            // Pointer travel past the threshold makes this a drag rather than a click,
+            // which is what keeps a drag-and-drop from also toggling a stopwatch.
+            if (std::abs(p.x - g_dragOrigin.x) > DRAG_THRESHOLD
+                || std::abs(p.y - g_dragOrigin.y) > DRAG_THRESHOLD) g_dragMoved = true;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
     }
     case WM_LBUTTONUP:
@@ -1992,7 +2118,7 @@ case WM_KEYDOWN: {
     }
     case WM_CAPTURECHANGED:
         // Cancel the drag if Windows takes mouse capture away from this window.
-        if (g_dragIndex >= 0) { g_dragIndex = -1; InvalidateRect(hwnd, nullptr, FALSE); }
+        if (g_dragIndex >= 0) { g_dragIndex = -1; g_dragMoved = false; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
     case WM_APP_UPDATE_CHECK:
         StartStartupUpdateCheck(hwnd);
@@ -2073,9 +2199,26 @@ case WM_KEYDOWN: {
                 SelectObject(mem, penSelected);
                 Rectangle(mem, r.left, r.top, r.right, r.bottom);
             }
-            // Task text.
-            SelectObject(mem, g_font); SetTextColor(mem, RGB(225,225,225));
+            // Task text. A blocked card also carries its blocker description
+            // right-aligned in red on this row, so the note is measured first and
+            // the text is handed whatever is left of the row.
             RECT text = r; text.left += 12; text.right -= 12; text.bottom = text.top + 30;
+            RECT note = text;
+            if (g_cards[index].blocked && !g_cards[index].blockerNote.empty()) {
+                SelectObject(mem, g_font);
+                SIZE measured{};
+                GetTextExtentPoint32W(mem, g_cards[index].blockerNote.c_str(),
+                    (int)g_cards[index].blockerNote.size(), &measured);
+                // The note never takes more than half the row, so the task text keeps
+                // at least as much space; anything longer is ellipsized.
+                int width = std::min(measured.cx, (note.right - note.left) / 2);
+                note.left = note.right - width;
+                text.right = note.left - 8;
+                SetTextColor(mem, RGB(220, 50, 50));
+                DrawTextW(mem, g_cards[index].blockerNote.c_str(), -1, &note,
+                    DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+            SelectObject(mem, g_font); SetTextColor(mem, RGB(225,225,225));
             DrawTextW(mem, g_cards[index].text.c_str(), -1, &text, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             // Timer row (below task text): total time left-justified in gray,
             // live countup right-justified in green with a "+". The countup shows
@@ -2128,6 +2271,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     // Register the main window class: this tells Windows how to create and draw board windows.
     WNDCLASSEXW mainClass{sizeof(mainClass)};
     mainClass.lpfnWndProc = MainProc; mainClass.hInstance = instance; mainClass.lpszClassName = MAIN_CLASS;
+    // CS_DBLCLKS is what makes Windows send WM_LBUTTONDBLCLK (start/stop stopwatch).
+    mainClass.style = CS_DBLCLKS;
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(APP_ICON), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
     mainClass.hIconSm = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(APP_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
