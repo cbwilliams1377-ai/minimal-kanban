@@ -46,7 +46,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Data Structures & Globals (lines 14–50)
 
-- `Card` — struct: `{ std::wstring text; int column; bool blocked; std::wstring blockerNote; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `blockerNote` is the short blocker description asked for when a card is blocked (drawn in red on the card, dropped again when it is unblocked). `timerAccumulated` is the total lifetime time (only a "Reset Time" folds a countup into it); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "Reset Time"; `timerStart` is a QPC timestamp when running (0 = stopped). Only cards in the Todo column (0) may run a stopwatch.
+- `Card` — struct: `{ std::wstring text; int column; bool blocked; std::wstring blockerNote; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `blockerNote` is the short blocker description asked for when a card is blocked (drawn in red on the card, dropped again when it is unblocked). `timerAccumulated` is the total lifetime time (only a "Reset Time" folds a countup into it); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "Reset Time"; `timerStart` is a QPC timestamp when running (0 = stopped). Only cards in the In-Progress column (1) may run a stopwatch.
 - `g_cards` — `vector<Card>`, the entire board state in memory.
 - `g_font` / `g_boldFont` — Segoe UI 16pt normal/semibold, created at startup.
 - `g_dragIndex` — index of card being dragged (-1 = none).
@@ -62,7 +62,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `CMD_EDIT`/`CMD_DELETE`/`CMD_TOGGLE_TIMER`/`CMD_EDIT_TIMER`/`CMD_BLOCKED` — context menu command IDs (`CMD_REPORT`/`CMD_REPORT_PROMPT`/`CMD_UPDATE`/`CMD_AUTO_UPDATE`/`CMD_RELOAD_HOTKEYS` — global menu command IDs).
 - `MenuItemData` — owner-drawn context menu item struct (label + keyboard hint).
 - `HK_ADD`...`HK_NEW_DAY` (`HK_COUNT`-sized) — enum of the board actions that `hotkeys.json` can rebind; `HK_NAMES[HK_COUNT]` maps each action to its file key. `Hotkey{mods, vk}` is one shortcut (MOD_* flags + virtual-key). `g_hotkeys[HK_COUNT]` holds the current binding list per action (vector: an action can have several keys, e.g. delete = Del + D).
-- `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66), `DRAG_THRESHOLD` (4), `BLOCKER_NOTE_MAX` (60) — constants. `PROMPT_CLIENT_W` (460), `PROMPT_CLIENT_H` (180), `PROMPT_LIMIT` (4000) — report prompt dialog size/text limits. `CONFIRM_CLIENT_W` (360), `CONFIRM_CLIENT_H` (150), `CONFIRM_TEXT_MAX` (120) — delete confirmation dialog size and how much card text it quotes.
+- `COL_INPROGRESS` (1), `TIMER_LIVE`, `CARD_HEIGHT` (60), `CARD_SPACING` (66), `DRAG_THRESHOLD` (4), `BLOCKER_NOTE_MAX` (60) — constants. `COL_INPROGRESS` is the one column whose cards may run a stopwatch. `PROMPT_CLIENT_W` (460), `PROMPT_CLIENT_H` (180), `PROMPT_LIMIT` (4000) — report prompt dialog size/text limits. `CONFIRM_CLIENT_W` (360), `CONFIRM_CLIENT_H` (150), `CONFIRM_TEXT_MAX` (120) — delete confirmation dialog size and how much card text it quotes.
 
 ### Data Path (lines 27–39)
 
@@ -112,16 +112,16 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Card Action Helpers (lines ~540–558)
 
-- `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, double-click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time). Only cards in the **Todo** column may count up; starting elsewhere shows a message box and changes nothing.
+- `ToggleTimer(HWND, index)` — shared start/pause logic for the stopwatch (used by Shift+click, double-click, `S` key, and menu). Pausing freezes the in-flight stretch into `sessionAccumulated` (not `timerAccumulated`), so the live countup keeps its value. Starting while another card is running **switches the run over**: the previous card is paused the same way, so the stopwatch always moves to the card the user just toggled (only one runs at a time). Only cards in the **In-Progress** column may count up; starting elsewhere shows a message box and changes nothing.
 - `ToggleBlocked(HWND, index)` — shared blocked-flag toggle (used by Ctrl+click, `B` key, and menu). Blocking a card first asks for a short description of the blocker through the add-card dialog (capped at `BLOCKER_NOTE_MAX`); submitting it blank still blocks the card without a note, cancelling changes nothing, and unblocking drops the description with the flag.
-- `PauseCardTimer(int index)` — ends a card's run, freezing its in-flight stretch into `sessionAccumulated`. The single place a run stops other than by choice: the pause toggle, switching the run to another card, and a card leaving the Todo column (drag-drop and Ctrl+Arrow).
+- `PauseCardTimer(int index)` — ends a card's run, freezing its in-flight stretch into `sessionAccumulated`. The single place a run stops other than by choice: the pause toggle, switching the run to another card, and a card leaving the In-Progress column (drag-drop and Ctrl+Arrow).
 - `PendingCountupMs()` — total countup waiting to be pushed (all cards, running stretches included); the amount the "Reset Time" button displays.
 - `ResetTime(HWND)` — the "Reset Time" action, the *only* thing that pushes time: folds every card's countup (running or paused, including ones carried over from earlier launches) into its `timerAccumulated`, stops all running stopwatches, and saves. Triggered by the In-Progress column button, the `new_day` hotkey (**Ctrl+Y**), and the global context menu. Nothing folds automatically at launch, so countups survive a close and reopen untouched. Not undoable.
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
 - `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom).
 - `SelectStep(HWND, delta)` — moves the focus box one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
 - `SelectColumn(HWND, delta)` — moves the focus box into the neighbouring column (-1) / +1) and onto the card nearest the row it is on; with nothing focused, Left lands on Todo's first card and Right on Complete's first. Only the box moves, never a card.
-- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box, and a card that leaves Todo has its stopwatch paused.
+- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box, and a card that leaves In-Progress has its stopwatch paused.
 - `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the focused card.
 - `FixSelectionAfterErase(HWND, int)` — keeps `g_selected` on the same card after a deletion shifts the vector, hiding the box when the focused card is the one that went away.
 - `DeleteCard(HWND, index)` — shared delete path (used by the `Delete`/`D` key and the context menu): asks for confirmation first, then erases, fixes the selection, saves and redraws. See the Delete Confirmation Dialog below.
@@ -186,7 +186,7 @@ Handles all main board interactions:
 - **WM_LBUTTONDOWN** — on a card: **Shift+click** toggles stopwatch, **Ctrl+click** toggles blocked, plain click starts a drag. Click on the Add button adds a card; click on the "Reset Time" button in In-Progress pushes every countup into its total.
 - **WM_LBUTTONDBLCLK** — toggles the stopwatch on the card under the pointer (the mouse equivalent of `S`). The main window class carries `CS_DBLCLKS` so Windows sends this message, and it arrives instead of the second `WM_LBUTTONDOWN`, i.e. after the drag the first press started has already been dropped. `g_dragMoved` (set once the pointer travelled past `DRAG_THRESHOLD`) makes a real drag-and-drop swallow the double-click, and a double-click with Shift/Ctrl held does nothing since the first press already acted.
 - **WM_MOUSEMOVE** — tracks `g_lastMouse`; updates dragged-card ghost while a drag is active, and flags `g_dragMoved` once the pointer has travelled past `DRAG_THRESHOLD`.
-- **WM_LBUTTONUP** — drops card into whichever column the mouse is over, pausing its stopwatch if it left the Todo column.
+- **WM_LBUTTONUP** — drops card into whichever column the mouse is over, pausing its stopwatch if it left the In-Progress column.
 - **WM_RBUTTONUP** — owner-drawn dark context menu on the card under the pointer: **Edit**, **Delete**, **Toggle Timer**, **Edit Timer**, **Blocked** (the right-aligned key hints come from the configured bindings). Right-click on empty board space shows the global menu: **Report a Bug**, **Report with Prompt...**, **Check for Updates**, the automatic-update mode toggle, **Reset Time (push countups to totals)**, and **Reload Hotkeys** (re-reads `hotkeys.json` without restarting). Wires to the same helpers as keyboard/mouse paths.
 - **WM_MEASUREITEM** / **WM_DRAWITEM** — owner-drawn popup menu sizing/painting: black bg RGB(27,27,27), white label, gray right-aligned key hint, hover highlight RGB(70,70,70).
 - **WM_CAPTURECHANGED** — cancels drag if capture lost.
@@ -281,8 +281,8 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 |--------|-------|----------|
 | Select a card | Hover the pointer over it | **Up** / **Down** (focus box) |
 | Move the focus box to the adjacent column (only the box moves) | Hover the pointer over it | **Left** / **Right** |
-| Move card between columns (leaving Todo pauses the stopwatch) | Drag (plain click) | **Ctrl+Left** / **Ctrl+Right** on the selected card |
-| Toggle stopwatch start/stop on a Todo card (starts a running stopwatch on the other card) | Shift+left-click or double-click | **S** |
+| Move card between columns (leaving In-Progress pauses the stopwatch) | Drag (plain click) | **Ctrl+Left** / **Ctrl+Right** on the selected card |
+| Toggle stopwatch start/stop on an In-Progress card (starts a running stopwatch on the other card) | Shift+left-click or double-click | **S** |
 | Toggle blocked flag (red outline; blocking asks for a description, shown in red on the card) | Ctrl+left-click | **B** |
 | Edit card text | Right-click → Edit | **Space** |
 | Delete card (asks for confirmation first) | Right-click → Delete | **Delete** or **D** |
@@ -300,8 +300,8 @@ The **focus box** is a black 3px outline and follows the user: it lands on the c
 Every keyboard shortcut above is a **default** editable in `hotkeys.json` (see Data Format); the keys
 shown in the menus and on the "+ Add a card" and "Reset Time" buttons always reflect the current bindings.
 
-Stopwatches only count up in the **Todo** column: starting one elsewhere (Shift+click, double-click,
-**S**, or the card menu) says so and changes nothing, and a card dragged or keyed out of Todo has its
+Stopwatches only count up in the **In-Progress** column: starting one elsewhere (Shift+click, double-click,
+**S**, or the card menu) says so and changes nothing, and a card dragged or keyed out of In-Progress has its
 stopwatch paused with the countup kept for the next "Reset Time".
 
 ## Dialog Interactions

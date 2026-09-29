@@ -90,6 +90,7 @@ static Settings g_settings;
 static volatile LONG g_updateBusy = 0;
 static volatile LONG g_updateCancelled = 0;
 
+#define COL_INPROGRESS 1                 // The one column whose cards may run a stopwatch.
 #define TIMER_LIVE 1                     // Timer ID for the live stopwatch tick.
 #define TIMER_FOCUS 2                    // Timer ID for the focus box idle countdown tick.
 #define FOCUS_IDLE_MS 10000              // Idle time before the focus box falls back to the running stopwatch.
@@ -757,7 +758,7 @@ static std::wstring BuildHelpText() {
     t += L"  Task text - the card's description\r\n";
     t += L"  Gray time - the total stopwatch time\r\n";
     t += L"  Green +time - the current stopwatch countup (running or paused; survives restarts, cleared by Reset Time)\r\n";
-    t += L"    A stopwatch only counts up on a card in the Todo column, and moving a card out of Todo pauses it\r\n";
+    t += L"    A stopwatch only counts up on a card in the In-Progress column, and moving a card out of In-Progress pauses it\r\n";
     t += L"  Red outline - the card is blocked\r\n";
     t += L"  Red note on the right - what is blocking a blocked card\r\n";
     t += L"  Green outline - the stopwatch is running on this card\r\n";
@@ -767,9 +768,9 @@ static std::wstring BuildHelpText() {
     t += L"Mouse:\r\n";
     t += L"  Click \"+ Add a card\" - add a task to the Todo column\r\n";
     t += L"  Click \"Reset Time\" at the bottom of In-Progress - push every countup into its card's total\r\n";
-    t += L"  Drag a card - move it to another column (leaving Todo pauses its stopwatch)\r\n";
-    t += L"  Shift+click a card - start/stop its stopwatch (Todo cards only)\r\n";
-    t += L"  Double-click a card - start/stop its stopwatch (Todo cards only)\r\n";
+    t += L"  Drag a card - move it to another column (leaving In-Progress pauses its stopwatch)\r\n";
+    t += L"  Shift+click a card - start/stop its stopwatch (In-Progress cards only)\r\n";
+    t += L"  Double-click a card - start/stop its stopwatch (In-Progress cards only)\r\n";
     t += L"  Ctrl+click a card - block or unblock it (blocking asks for a description)\r\n";
     t += L"  Right-click a card - edit, delete or set its timer\r\n";
     t += L"  Right-click empty board space - reports, updates, reload hotkeys\r\n";
@@ -779,7 +780,7 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  Add a new card", HK_ADD) + L"\r\n";
     t += HelpBindingLine(L"  Edit card text", HK_EDIT) + L"\r\n";
     t += HelpBindingLine(L"  Delete card (asks to confirm)", HK_DELETE) + L"\r\n";
-    t += HelpBindingLine(L"  Toggle stopwatch (Todo cards only)", HK_TOGGLE_TIMER) + L"\r\n";
+    t += HelpBindingLine(L"  Toggle stopwatch (In-Progress cards only)", HK_TOGGLE_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Set stopwatch time manually", HK_EDIT_TIMER) + L"\r\n";
     t += HelpBindingLine(L"  Toggle blocked flag (blocking asks for a description)", HK_BLOCKED) + L"\r\n";
     t += HelpBindingLine(L"  Select previous card", HK_SELECT_UP) + L"\r\n";
@@ -1419,7 +1420,7 @@ static bool AskConfirm(HWND owner, const std::wstring& question, const std::wstr
 // Pause a card's stopwatch, freezing its in-flight stretch into the countup so
 // the "+" display keeps the value it had. Every path that ends a run comes
 // through here: the pause toggle, switching the run to another card, and a card
-// leaving the Todo column (the only column a stopwatch may count up in).
+// leaving the In-Progress column (the only column a stopwatch may count up in).
 static void PauseCardTimer(int index) {
     if (g_cards[index].timerStart == 0) return;
     g_cards[index].sessionAccumulated += (NowMs() - g_cards[index].timerStart);
@@ -1427,7 +1428,7 @@ static void PauseCardTimer(int index) {
 }
 
 // Toggle the stopwatch for a card: start when stopped, pause when running.
-// A stopwatch only counts up on a card in the Todo column, so starting one
+// A stopwatch only counts up on a card in the In-Progress column, so starting one
 // anywhere else is refused with a short explanation. Starting while another card
 // is running switches the run over: the previous card is paused first (freezing
 // its in-flight stretch into sessionAccumulated), so exactly one stopwatch runs
@@ -1440,10 +1441,10 @@ static void ToggleTimer(HWND hwnd, int index) {
         PauseCardTimer(index);
         if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     } else {
-        if (g_cards[index].column != 0) {
+        if (g_cards[index].column != COL_INPROGRESS) {
             MessageBoxW(hwnd,
-                L"Stopwatches only count up on cards in the Todo column.\n"
-                L"Move this card back to Todo to run its stopwatch.",
+                L"Stopwatches only count up on cards in the In-Progress column.\n"
+                L"Move this card to In-Progress to run its stopwatch.",
                 L"Stopwatch", MB_OK | MB_ICONINFORMATION);
             return;
         }
@@ -1555,14 +1556,14 @@ static void SelectColumn(HWND hwnd, int delta) {
 
 // Move the selected card one column left (-1) or right (+1); it stays selected afterwards.
 // This is the Ctrl+Arrow chord, so a plain arrow press only walks the focus box.
-// Only the Todo column runs stopwatches, so a card that leaves it also has its
+// Only the In-Progress column runs stopwatches, so a card that leaves it also has its
 // stopwatch paused (its countup is kept for the next "Reset Time").
 static void MoveSelectedColumn(HWND hwnd, int delta) {
     if (g_selected < 0 || g_selected >= (int)g_cards.size()) return;
     int column = g_cards[g_selected].column + delta;
     if (column < 0 || column > 2) return; // Already in the first/last column.
     g_cards[g_selected].column = column;
-    if (column != 0) PauseCardTimer(g_selected);
+    if (column != COL_INPROGRESS) PauseCardTimer(g_selected);
     if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     SaveCards(); FocusCard(hwnd, g_selected);
 }
@@ -1975,9 +1976,9 @@ case WM_KEYDOWN: {
             RECT client{}; GetClientRect(hwnd, &client);
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             for (int c = 0; c < 3; ++c) { RECT r = ColumnRect(client, c); if (PtInRect(&r, p)) g_cards[g_dragIndex].column = c; }
-            // Only the Todo column runs stopwatches, so dropping a card anywhere
+            // Only the In-Progress column runs stopwatches, so dropping a card anywhere
             // else pauses it and keeps its countup for the next "Reset Time".
-            if (g_cards[g_dragIndex].column != 0) PauseCardTimer(g_dragIndex);
+            if (g_cards[g_dragIndex].column != COL_INPROGRESS) PauseCardTimer(g_dragIndex);
             if (!AnyTimerRunning()) StopLiveTimer(hwnd);
             g_dragIndex = -1; ReleaseCapture(); SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
         }
