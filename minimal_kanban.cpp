@@ -25,6 +25,7 @@ struct Card {
     LONGLONG timerAccumulated = 0; // completed time from runs before this program run
     LONGLONG sessionAccumulated = 0; // paused countup time; persisted and cleared by a "Reset Time"
     LONGLONG timerStart = 0;       // QPC timestamp when running (0 = stopped)
+    LONGLONG completedAt = 0;      // epoch ms when the card entered Complete; 0 = undated
 };
 
 struct Settings {
@@ -38,7 +39,7 @@ struct Settings {
 enum {
     HK_ADD = 0, HK_EDIT, HK_DELETE, HK_TOGGLE_TIMER, HK_EDIT_TIMER, HK_BLOCKED,
     HK_SELECT_UP, HK_SELECT_DOWN, HK_SELECT_LEFT, HK_SELECT_RIGHT, HK_MOVE_LEFT, HK_MOVE_RIGHT,
-    HK_REPORT, HK_REPORT_PROMPT, HK_UPDATE, HK_NEW_DAY, HK_COUNT
+    HK_REPORT, HK_REPORT_PROMPT, HK_UPDATE, HK_NEW_DAY, HK_SHOW_EARLIER, HK_COUNT
 };
 
 // One keyboard shortcut: modifier flags (MOD_*) plus a virtual-key code.
@@ -54,6 +55,7 @@ static bool g_dragMoved = false; // True once the drag moved past DRAG_THRESHOLD
 static POINT g_lastMouse{}; // Last known mouse position, used for hover-based keyboard actions.
 static int g_selected = -1; // Index of the card the focus box is on; -1 means the box is hidden.
 static LONGLONG g_focusAt = 0; // When the focus box last moved (QPC ms); 0 = no idle countdown pending.
+static bool g_showEarlier = false; // True once "Show earlier" reveals older completed cards this session.
 static const wchar_t* MAIN_CLASS = L"MinimalKanbanWindow"; // Name of the main window class.
 static const wchar_t* INPUT_CLASS = L"MinimalKanbanInput"; // Name of the add-card window class.
 static const wchar_t* TIME_CLASS = L"MinimalKanbanTimeInput"; // Name of the timer entry window class.
@@ -72,7 +74,7 @@ static const wchar_t* HK_NAMES[HK_COUNT] = {
     L"add", L"edit", L"delete", L"toggle_timer", L"edit_timer", L"blocked",
     L"select_up", L"select_down", L"select_left", L"select_right",
     L"move_left", L"move_right",
-    L"report", L"report_prompt", L"update", L"new_day"
+    L"report", L"report_prompt", L"update", L"new_day", L"show_earlier"
 };
 // The current binding set, loaded from hotkeys.json at startup or on "Reload Hotkeys".
 static std::vector<Hotkey> g_hotkeys[HK_COUNT];
@@ -91,6 +93,7 @@ static volatile LONG g_updateBusy = 0;
 static volatile LONG g_updateCancelled = 0;
 
 #define COL_INPROGRESS 1                 // The one column whose cards may run a stopwatch.
+#define COL_COMPLETE 2                   // Cards here are filtered to today's completions by default.
 #define TIMER_LIVE 1                     // Timer ID for the live stopwatch tick.
 #define TIMER_FOCUS 2                    // Timer ID for the focus box idle countdown tick.
 #define FOCUS_IDLE_MS 10000              // Idle time before the focus box falls back to the running stopwatch.
@@ -170,6 +173,72 @@ static std::wstring Wide(const std::string& s) {
 static LONGLONG NowMs() {
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     return t.QuadPart * 1000 / g_qpcFreq.QuadPart;
+}
+
+// Convert between the epoch milliseconds stored in board.json and Windows' UTC
+// FILETIME. FILETIME counts 100ns ticks from 1601-01-01, which is 11644473600
+// seconds before the Unix epoch, so one constant converts in either direction.
+#define EPOCH_TO_FILETIME 116444736000000000ULL
+static FILETIME EpochMsToFileTime(LONGLONG ms) {
+    ULARGE_INTEGER u;
+    u.QuadPart = (ULONGLONG)ms * 10000ULL + EPOCH_TO_FILETIME;
+    return FILETIME{ u.LowPart, u.HighPart };
+}
+
+// The current time as epoch milliseconds (UTC), stamped into a card when it
+// reaches the Complete column.
+static LONGLONG NowEpochMs() {
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return (LONGLONG)((u.QuadPart - EPOCH_TO_FILETIME) / 10000ULL);
+}
+
+// True when a completion timestamp falls on today's local calendar day. The
+// stamp is kept in UTC and converted to local time here, so "today" means the
+// machine's current day whatever the time zone. An undated card (0) is never
+// today's: it predates the field and is only reachable via "Show earlier".
+static bool CompletedToday(LONGLONG completedAt) {
+    if (completedAt <= 0) return false;
+    FILETIME utc = EpochMsToFileTime(completedAt), local{};
+    if (!FileTimeToLocalFileTime(&utc, &local)) return false;
+    SYSTEMTIME stamp{};
+    if (!FileTimeToSystemTime(&local, &stamp)) return false;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    return stamp.wYear == now.wYear && stamp.wMonth == now.wMonth && stamp.wDay == now.wDay;
+}
+
+// True when a card is on screen. The Complete column shows only today's
+// completions until the user asks for the earlier ones with "Show earlier";
+// Todo and In-Progress are never filtered, so no card in flight is ever hidden.
+static bool CardVisible(int index) {
+    if (index < 0 || index >= (int)g_cards.size()) return false;
+    if (g_cards[index].column != COL_COMPLETE) return true;
+    return g_showEarlier || CompletedToday(g_cards[index].completedAt);
+}
+
+// How many completed cards the filter is currently hiding; the count the
+// "Show earlier (N)" button reports.
+static int HiddenCompletedCount() {
+    int hidden = 0;
+    for (int i = 0; i < (int)g_cards.size(); ++i)
+        if (g_cards[i].column == COL_COMPLETE && !CardVisible(i)) ++hidden;
+    return hidden;
+}
+
+// Put a card in another column, keeping its completion timestamp in step: the
+// stamp is set on the way into Complete and cleared when the card re-opens, so a
+// card completed at 23:50 and re-opened at 00:10 is not counted as today's until
+// it is completed again. Every path that changes a column goes through here, so
+// the stamp can never drift away from the card's actual position.
+static void SetCardColumn(int index, int column) {
+    if (index < 0 || index >= (int)g_cards.size()) return;
+    if (g_cards[index].column == column) return; // A drop back into its own column is not a completion.
+    g_cards[index].column = column;
+    g_cards[index].completedAt = (column == COL_COMPLETE) ? NowEpochMs() : 0;
 }
 
 // Get the milliseconds of the current running session for a card (0 when stopped).
@@ -351,12 +420,27 @@ static bool JsonEscapedField(const std::string& line, const char* key, std::wstr
     return true;
 }
 
+// Read an optional integer field out of a saved card line (default 0 when the
+// field is absent or malformed, so cards written by older builds still load).
+static LONGLONG JsonNumberField(const std::string& line, const char* key) {
+    size_t p = line.find(key);
+    if (p == std::string::npos) return 0;
+    size_t colon = line.find(':', p);
+    if (colon == std::string::npos) return 0;
+    size_t end = line.find(',', colon);
+    if (end == std::string::npos) end = line.find('}', colon);
+    if (end == std::string::npos) return 0;
+    try { return std::stoll(line.substr(colon + 1, end - colon - 1)); } catch (...) { return 0; }
+}
+
 // Write every card to the board.json file.
 // Timers are NOT stopped here: "timer_ms" is the accumulated total and
 // "session_ms" is the live countup (paused stretches plus any in-flight run),
 // so a running or paused stopwatch survives saves and restarts with its "+"
 // display intact. (WM_DESTROY saves; on reload the timers restore stopped.)
 // Only "Reset Time" ever folds a countup into a total.
+// "completed_at" is the epoch time a card entered the Complete column, which is
+// what lets the board tell today's completions from older ones on the next launch.
 static void SaveCards() {
     // trunc clears the previous file before writing the current board.
     std::ofstream f(std::filesystem::path(DataPath()), std::ios::binary | std::ios::trunc);
@@ -369,6 +453,7 @@ static void SaveCards() {
           << ", \"blocker_note\": \"" << JsonEscape(Utf8(g_cards[i].blockerNote)) << "\""
           << ", \"timer_ms\": " << g_cards[i].timerAccumulated
           << ", \"session_ms\": " << (g_cards[i].sessionAccumulated + SessionElapsedMs(g_cards[i]))
+          << ", \"completed_at\": " << g_cards[i].completedAt
           << "}";
         if (i + 1 != g_cards.size()) f << ',';
         f << '\n';
@@ -406,26 +491,13 @@ static void LoadCards() {
             }
         }
         // Parse optional "timer_ms" field (default 0 for backward compatibility).
-        size_t tp2 = line.find("\"timer_ms\"");
-        if (tp2 != std::string::npos) {
-            size_t tcolon = line.find(':', tp2);
-            if (tcolon != std::string::npos) {
-                size_t tcomma = line.find(',', tcolon);
-                if (tcomma == std::string::npos) tcomma = line.find('}', tcolon);
-                try { card.timerAccumulated = std::stoll(line.substr(tcolon + 1, tcomma - tcolon - 1)); } catch (...) {}
-            }
-        }
+        card.timerAccumulated = JsonNumberField(line, "\"timer_ms\"");
         // Parse optional "session_ms" field: the persisted countup (default 0 for
         // backward compatibility). Restored stopped; a live run is not resumed.
-        size_t sp = line.find("\"session_ms\"");
-        if (sp != std::string::npos) {
-            size_t scolon = line.find(':', sp);
-            if (scolon != std::string::npos) {
-                size_t scomma = line.find(',', scolon);
-                if (scomma == std::string::npos) scomma = line.find('}', scolon);
-                try { card.sessionAccumulated = std::stoll(line.substr(scolon + 1, scomma - scolon - 1)); } catch (...) {}
-            }
-        }
+        card.sessionAccumulated = JsonNumberField(line, "\"session_ms\"");
+        // Parse optional "completed_at" field: when the card entered the Complete
+        // column (default 0, i.e. undated, for cards saved by older builds).
+        card.completedAt = JsonNumberField(line, "\"completed_at\"");
         g_cards.push_back(card);
     }
 }
@@ -469,6 +541,9 @@ static void ResetHotkeysToDefaults() {
     g_hotkeys[HK_REPORT_PROMPT] = { { MOD_CONTROL | MOD_SHIFT, 'R' } };
     g_hotkeys[HK_UPDATE]        = { { MOD_CONTROL, 'U' } };
     g_hotkeys[HK_NEW_DAY]       = { { MOD_CONTROL, 'Y' } };
+    // Plain "E": unbound by every other action, and the same shape as the other
+    // single-key board shortcuts (D, S, T, B).
+    g_hotkeys[HK_SHOW_EARLIER]  = { { 0, 'E' } };
 }
 
 // Turn one key name (as written in hotkeys.json) into a virtual-key code.
@@ -713,6 +788,14 @@ static RECT AddRect(const RECT& col) { return {col.left + 10, col.bottom - 40, c
 // Calculate the clickable "Reset Time" area at the bottom of the In-Progress column.
 static RECT ResetRect(const RECT& col) { return {col.left + 10, col.bottom - 40, col.right - 10, col.bottom - 10}; }
 
+// Calculate the clickable "Show earlier" area at the bottom of the Complete column.
+static RECT ShowEarlierRect(const RECT& col) { return {col.left + 10, col.bottom - 40, col.right - 10, col.bottom - 10}; }
+
+// The "Show earlier (N)" button exists only while the filter is actually hiding
+// something. Painting and hit-testing both go through this, so the drawn button
+// and the clickable area can never disagree.
+static bool ShowEarlierButtonShown() { return !g_showEarlier && HiddenCompletedCount() > 0; }
+
 // Ask Windows to use a dark title bar when that feature is available.
 static void SetDarkTitleBar(HWND hwnd) {
     HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -753,6 +836,7 @@ static std::wstring BuildHelpText() {
     t += L"  Todo - tasks not started yet\r\n";
     t += L"  In-Progress - tasks being worked on now\r\n";
     t += L"  Complete - finished tasks\r\n";
+    t += L"    Shows the tasks completed today; \"Show earlier\" reveals the rest for this session\r\n";
     t += L"\r\n";
     t += L"Cards:\r\n";
     t += L"  Task text - the card's description\r\n";
@@ -768,6 +852,7 @@ static std::wstring BuildHelpText() {
     t += L"Mouse:\r\n";
     t += L"  Click \"+ Add a card\" - add a task to the Todo column\r\n";
     t += L"  Click \"Reset Time\" at the bottom of In-Progress - push every countup into its card's total\r\n";
+    t += L"  Click \"Show earlier\" at the bottom of Complete - reveal the completions from before today\r\n";
     t += L"  Drag a card - move it to another column (leaving In-Progress pauses its stopwatch)\r\n";
     t += L"  Shift+click a card - start/stop its stopwatch (In-Progress cards only)\r\n";
     t += L"  Double-click a card - start/stop its stopwatch (In-Progress cards only)\r\n";
@@ -793,6 +878,7 @@ static std::wstring BuildHelpText() {
     t += HelpBindingLine(L"  File a report in your own words", HK_REPORT_PROMPT) + L"\r\n";
     t += HelpBindingLine(L"  Check for updates", HK_UPDATE) + L"\r\n";
     t += HelpBindingLine(L"  Reset Time: fold every countup into its total", HK_NEW_DAY) + L"\r\n";
+    t += HelpBindingLine(L"  Show the completed tasks from before today", HK_SHOW_EARLIER) + L"\r\n";
     t += L"\r\n";
     t += L"Keyboard card actions apply to the card under the mouse, falling back\r\n";
     t += L"to the focused card when the pointer is not over one. Acting on a card\r\n";
@@ -868,11 +954,14 @@ static void ShowHelp(HWND owner) {
 
 // Return the rectangles of all cards that fit inside their columns.
 // Each pair contains the card's index in g_cards and its screen rectangle.
+// Cards the Complete-column filter is hiding are skipped here, which is what
+// keeps them off screen, unclickable and unreachable by the arrow keys.
 static std::vector<std::pair<int, RECT>> CardRects(const RECT& client) {
     std::vector<std::pair<int, RECT>> result;
     int y[3] = {62, 62, 62};
     for (int i = 0; i < (int)g_cards.size(); ++i) {
         int c = g_cards[i].column;
+        if (!CardVisible(i)) continue;
         RECT col = ColumnRect(client, c);
         RECT r{col.left + 10, y[c], col.right - 10, y[c] + CARD_HEIGHT};
         if (r.bottom < col.bottom - 48) result.push_back({i, r});
@@ -1509,11 +1598,12 @@ static int HoverIndex(const RECT& client, const POINT& p) {
 }
 
 // The card indices in the order they appear on screen: column by column, top to bottom.
+// Hidden completed cards are left out, matching what CardRects paints and hit-tests.
 static std::vector<int> VisibleOrder() {
     std::vector<int> order;
     for (int c = 0; c < 3; ++c)
         for (size_t i = 0; i < g_cards.size(); ++i)
-            if (g_cards[i].column == c) order.push_back((int)i);
+            if (g_cards[i].column == c && CardVisible((int)i)) order.push_back((int)i);
     return order;
 }
 
@@ -1562,10 +1652,21 @@ static void MoveSelectedColumn(HWND hwnd, int delta) {
     if (g_selected < 0 || g_selected >= (int)g_cards.size()) return;
     int column = g_cards[g_selected].column + delta;
     if (column < 0 || column > 2) return; // Already in the first/last column.
-    g_cards[g_selected].column = column;
+    SetCardColumn(g_selected, column); // Stamps or clears the completion time.
     if (column != COL_INPROGRESS) PauseCardTimer(g_selected);
     if (!AnyTimerRunning()) StopLiveTimer(hwnd);
     SaveCards(); FocusCard(hwnd, g_selected);
+}
+
+// Reveal (or hide again) the completed cards from before today. This is view
+// state only, so it is deliberately kept in memory and never written to
+// settings.json: the board opens on today's completions after every launch and
+// the hidden cards stay in board.json either way. When the filter goes back on,
+// a focus box left on a card that just went out of view is hidden with it.
+static void ToggleShowEarlier(HWND hwnd) {
+    g_showEarlier = !g_showEarlier;
+    if (!CardVisible(g_selected)) FocusCard(hwnd, -1);
+    InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 // The card a keyboard action applies to: the one under the mouse if there is one,
@@ -1889,6 +1990,7 @@ case WM_KEYDOWN: {
         if (action == HK_REPORT_PROMPT) { ReportBugWithPrompt(hwnd); return 0; }
         if (action == HK_UPDATE) { UpdateCheck(hwnd); return 0; }
         if (action == HK_NEW_DAY) { ResetTime(hwnd); return 0; }
+        if (action == HK_SHOW_EARLIER) { ToggleShowEarlier(hwnd); return 0; }
         // The remaining actions apply to the card under the last mouse position,
         // or to the keyboard-selected card when the mouse is not over one.
         int hover = ActionIndex(hwnd);
@@ -1937,6 +2039,8 @@ case WM_KEYDOWN: {
         if (PtInRect(&add, p)) { AddCard(hwnd); return 0; }
         RECT reset = ResetRect(ColumnRect(client, 1));
         if (PtInRect(&reset, p)) { ResetTime(hwnd); return 0; }
+        RECT earlier = ShowEarlierRect(ColumnRect(client, 2));
+        if (ShowEarlierButtonShown() && PtInRect(&earlier, p)) { ToggleShowEarlier(hwnd); return 0; }
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
@@ -1975,7 +2079,7 @@ case WM_KEYDOWN: {
         if (g_dragIndex >= 0) {
             RECT client{}; GetClientRect(hwnd, &client);
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            for (int c = 0; c < 3; ++c) { RECT r = ColumnRect(client, c); if (PtInRect(&r, p)) g_cards[g_dragIndex].column = c; }
+            for (int c = 0; c < 3; ++c) { RECT r = ColumnRect(client, c); if (PtInRect(&r, p)) SetCardColumn(g_dragIndex, c); }
             // Only the In-Progress column runs stopwatches, so dropping a card anywhere
             // else pauses it and keeps its countup for the next "Reset Time".
             if (g_cards[g_dragIndex].column != COL_INPROGRESS) PauseCardTimer(g_dragIndex);
@@ -2155,10 +2259,19 @@ case WM_KEYDOWN: {
             SelectObject(mem, g_boldFont); SetTextColor(mem, RGB(220,220,220));
             RECT title{col.left + 16, col.top + 10, col.right - 50, col.top + 32};
             DrawTextW(mem, TITLES[c], -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            int count = 0; for (const auto& card : g_cards) if (card.column == c) ++count;
-            std::wstring countText = std::to_wstring(count);
+            int count = 0, total = 0;
+            for (size_t i = 0; i < g_cards.size(); ++i) {
+                if (g_cards[i].column != c) continue;
+                ++total;
+                if (CardVisible((int)i)) ++count;
+            }
+            // The Complete column counts only what is on screen, so when the filter
+            // is hiding older cards the count reads "shown/total" instead of lying.
+            std::wstring countText = (c == COL_COMPLETE && count < total)
+                ? std::to_wstring(count) + L"/" + std::to_wstring(total)
+                : std::to_wstring(count);
             SelectObject(mem, g_font); SetTextColor(mem, RGB(180,180,180));
-            RECT countRect{col.right - 42, col.top + 10, col.right - 14, col.top + 32};
+            RECT countRect{col.right - 52, col.top + 10, col.right - 14, col.top + 32};
             DrawTextW(mem, countText.c_str(), -1, &countRect, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             if (c == 0) {
                 RECT add = AddRect(col); Fill(mem, add, RGB(42,42,42));
@@ -2175,6 +2288,18 @@ case WM_KEYDOWN: {
                 if (pending >= 1000) resetLabel += L"  +" + FormatTimer(pending) + L" to totals";
                 SetTextColor(mem, RGB(190,190,190));
                 DrawTextW(mem, resetLabel.c_str(), -1, &reset, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+            if (c == COL_COMPLETE) {
+                // "Show earlier (N)": the way past the today's-only filter, labeled
+                // with how many earlier completions it would reveal. It disappears
+                // when there is nothing hidden, i.e. when "Show earlier" is already on.
+                if (ShowEarlierButtonShown()) {
+                    int hidden = HiddenCompletedCount();
+                    RECT earlier = ShowEarlierRect(col); Fill(mem, earlier, RGB(42,42,42));
+                    std::wstring label = L"Show earlier (" + std::to_wstring(hidden) + L") " + HotkeyHint(HK_SHOW_EARLIER);
+                    SetTextColor(mem, RGB(190,190,190));
+                    DrawTextW(mem, label.c_str(), -1, &earlier, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                }
             }
         }
         // Draw cards that are not currently being dragged.

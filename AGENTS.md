@@ -46,7 +46,7 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 
 ### Data Structures & Globals (lines 14–50)
 
-- `Card` — struct: `{ std::wstring text; int column; bool blocked; std::wstring blockerNote; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `blockerNote` is the short blocker description asked for when a card is blocked (drawn in red on the card, dropped again when it is unblocked). `timerAccumulated` is the total lifetime time (only a "Reset Time" folds a countup into it); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "Reset Time"; `timerStart` is a QPC timestamp when running (0 = stopped). Only cards in the In-Progress column (1) may run a stopwatch.
+- `Card` — struct: `{ std::wstring text; int column; bool blocked; std::wstring blockerNote; LONGLONG timerAccumulated; LONGLONG sessionAccumulated; LONGLONG timerStart; LONGLONG completedAt; }` where column is 0 (Todo), 1 (In-Progress), or 2 (Complete). `blockerNote` is the short blocker description asked for when a card is blocked (drawn in red on the card, dropped again when it is unblocked). `timerAccumulated` is the total lifetime time (only a "Reset Time" folds a countup into it); `sessionAccumulated` is the persisted countup (`session_ms`), cleared by a "Reset Time"; `timerStart` is a QPC timestamp when running (0 = stopped); `completedAt` is the epoch-ms time the card entered the Complete column (0 = undated), which is what the Complete column's "today only" filter reads. Only cards in the In-Progress column (1) may run a stopwatch.
 - `g_cards` — `vector<Card>`, the entire board state in memory.
 - `g_font` / `g_boldFont` — Segoe UI 16pt normal/semibold, created at startup.
 - `g_dragIndex` — index of card being dragged (-1 = none).
@@ -78,8 +78,8 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `JsonEscape(string)` — escapes `\`, `"`, `\n`, `\r`, `\t` for JSON strings.
 - `JsonUnescape(string)` — reverses the above.
 - `JsonEscapedField(line, key, out)` — reads one quoted, escaped string field out of a saved card line (used for `text` and `blocker_note`), skipping quotes a backslash has escaped; returns false when the key is absent or malformed.
-- `SaveCards()` — writes all cards to `board.json`. Writes `timer_ms` (persisted total) and `session_ms` (live countup: paused-session time + any in-flight stretch) per card and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves and restarts. `column`, `text`, `blocked`, `blocker_note`, `timer_ms`, `session_ms` per card.
-- `LoadCards()` — line-by-line parser that reads the format produced by `SaveCards`. Expects one `{"column": N, "text": "...", "blocked": true/false, "blocker_note": "...", "timer_ms": N, "session_ms": N}` per line. `blocked`, `blocker_note`, `timer_ms` and `session_ms` are optional (default false/""/0) for backward compatibility with older save files. Silently skips malformed lines.
+- `SaveCards()` — writes all cards to `board.json`. Writes `timer_ms` (persisted total) and `session_ms` (live countup: paused-session time + any in-flight stretch) per card and does **not** stop running timers in memory — so a live stopwatch survives mid-session saves and restarts. `column`, `text`, `blocked`, `blocker_note`, `timer_ms`, `session_ms`, `completed_at` per card.
+- `LoadCards()` — line-by-line parser that reads the format produced by `SaveCards`. Expects one `{"column": N, "text": "...", "blocked": true/false, "blocker_note": "...", "timer_ms": N, "session_ms": N, "completed_at": N}` per line. `blocked`, `blocker_note`, `timer_ms`, `session_ms` and `completed_at` are optional (default false/""/0/0) for backward compatibility with older save files. Silently skips malformed lines.
 
 ### Hotkeys (Hotkey internals, ~lines 350–520)
 
@@ -117,14 +117,26 @@ Produces `MinimalKanban.exe` (statically linked, no runtime DLLs needed).
 - `PauseCardTimer(int index)` — ends a card's run, freezing its in-flight stretch into `sessionAccumulated`. The single place a run stops other than by choice: the pause toggle, switching the run to another card, and a card leaving the In-Progress column (drag-drop and Ctrl+Arrow).
 - `PendingCountupMs()` — total countup waiting to be pushed (all cards, running stretches included); the amount the "Reset Time" button displays.
 - `ResetTime(HWND)` — the "Reset Time" action, the *only* thing that pushes time: folds every card's countup (running or paused, including ones carried over from earlier launches) into its `timerAccumulated`, stops all running stopwatches, and saves. Triggered by the In-Progress column button, the `new_day` hotkey (**Ctrl+Y**), and the global context menu. Nothing folds automatically at launch, so countups survive a close and reopen untouched. Not undoable.
+- `SetCardColumn(int index, int column)` — the single place a card changes column (drag-drop and Ctrl+Arrow). Stamps `completedAt` with the current epoch ms when the card enters Complete and clears it to 0 when the card re-opens, so the completion stamp can never drift from where the card actually sits. A drop back into the card's own column is not a completion and leaves the stamp alone.
 - `HoverIndex(client, point)` — returns the card index under a client-space point, or -1.
-- `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom).
+- `VisibleOrder()` — card indices in on-screen order (column by column, top to bottom). Hidden completed cards are left out, matching what `CardRects` paints and hit-tests.
 - `SelectStep(HWND, delta)` — moves the focus box one card up (-1) / down (+1); starts at the top card stepping down and the bottom one stepping up, and stops at the ends instead of wrapping.
 - `SelectColumn(HWND, delta)` — moves the focus box into the neighbouring column (-1) / +1) and onto the card nearest the row it is on; with nothing focused, Left lands on Todo's first card and Right on Complete's first. Only the box moves, never a card.
-- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box, and a card that leaves In-Progress has its stopwatch paused.
+- `MoveSelectedColumn(HWND, delta)` — moves the selected card one column left (-1) / right (+1); it keeps the focus box, a card that leaves In-Progress has its stopwatch paused, and the move goes through `SetCardColumn` so the completion stamp follows.
+- `ToggleShowEarlier(HWND)` — flips `g_showEarlier`, revealing the completed cards from before today for the rest of the session (or hiding them again). Pure view state, kept in memory and never written to `settings.json`; the board therefore opens on today's completions after every launch. Hides the focus box if it was left on a card that just went out of view. Triggered by the Complete-column button and the `show_earlier` hotkey (**E**).
 - `ActionIndex(HWND)` — the card a keyboard action applies to: the one under the mouse if there is one, otherwise the focused card.
 - `FixSelectionAfterErase(HWND, int)` — keeps `g_selected` on the same card after a deletion shifts the vector, hiding the box when the focused card is the one that went away.
 - `DeleteCard(HWND, index)` — shared delete path (used by the `Delete`/`D` key and the context menu): asks for confirmation first, then erases, fixes the selection, saves and redraws. See the Delete Confirmation Dialog below.
+
+### Complete-Column Date Filter
+
+- `EpochMsToFileTime(LONGLONG)` / `NowEpochMs()` — convert between the epoch milliseconds stored in `completed_at` and Windows' UTC `FILETIME` via the single `EPOCH_TO_FILETIME` constant.
+- `CompletedToday(LONGLONG)` — true when a completion stamp falls on **today's local calendar day**. The stamp is kept in UTC and converted with `FileTimeToLocalFileTime` before the day comparison, so "today" means the machine's current day in whatever time zone it is in. An undated card (0) is never today's, which is what keeps cards saved by a build that predates the field out of the default view.
+- `CardVisible(int)` — the visibility predicate. The Complete column shows only today's completions until "Show earlier" is turned on; Todo and In-Progress are never filtered, so nothing in flight is ever hidden.
+- `HiddenCompletedCount()` — how many completed cards the filter is hiding; the `N` in the "Show earlier (N)" button.
+- `ShowEarlierButtonShown()` — whether the button exists at all. Both the painting and the click hit-test go through it, so the drawn button and the clickable area can never disagree.
+- The filter is applied inside `CardRects()`, the single layout/hit-test choke point that painting, `HoverIndex` and `SelectColumn` all share, so a hidden card is not painted, not clickable and not reachable with the arrow keys. `VisibleOrder()` (used by `SelectStep`) is filtered to match.
+- The column header count shows what is on screen; when older cards are hidden the Complete column reads e.g. "1/4" rather than claiming a count the user cannot see.
 
 ### GDI Drawing Helpers (lines 229–276)
 
@@ -224,9 +236,9 @@ All network use is on-demand — there are no threads, timers, or persistent con
 ```json
 {
   "cards": [
-    {"column": 0, "text": "Buy groceries", "blocked": false, "blocker_note": "", "timer_ms": 0, "session_ms": 0},
-    {"column": 1, "text": "Write docs", "blocked": false, "blocker_note": "", "timer_ms": 90000, "session_ms": 12500},
-    {"column": 2, "text": "Ship v1.0", "blocked": true, "blocker_note": "waiting on the vendor", "timer_ms": 5435000, "session_ms": 0}
+    {"column": 0, "text": "Buy groceries", "blocked": false, "blocker_note": "", "timer_ms": 0, "session_ms": 0, "completed_at": 0},
+    {"column": 1, "text": "Write docs", "blocked": false, "blocker_note": "", "timer_ms": 90000, "session_ms": 12500, "completed_at": 0},
+    {"column": 2, "text": "Ship v1.0", "blocked": true, "blocker_note": "waiting on the vendor", "timer_ms": 5435000, "session_ms": 0, "completed_at": 1788912000000}
   ]
 }
 ```
@@ -237,6 +249,10 @@ All network use is on-demand — there are no threads, timers, or persistent con
 - `blocker_note`: the short blocker description shown in red on a blocked card (optional, defaults "")
 - `timer_ms`: accumulated stopwatch time in milliseconds (optional, defaults 0); grows when "Reset Time" pushes a countup
 - `session_ms`: the live countup ("+" display) in milliseconds (optional, defaults 0); cleared by a "Reset Time"
+- `completed_at`: epoch milliseconds at which the card entered the Complete column (optional, defaults 0 =
+  undated). Stamped on the way into Complete and cleared when the card re-opens, so it always matches the card's
+  actual position. 0 means "not dated": such a card (one saved by a build that predates the field) is never
+  counted as today's, and is only reachable via "Show earlier"
 
 `%LOCALAPPDATA%\MinimalKanban\hotkeys.json` (written once with the defaults on first run, then
 never rewritten by the app — edit it and reload via the right-click menu or restart):
@@ -258,7 +274,8 @@ never rewritten by the app — edit it and reload via the right-click menu or re
   "report": "Ctrl+R",
   "report_prompt": "Ctrl+Shift+R",
   "update": "Ctrl+U",
-  "new_day": "Ctrl+Y"
+  "new_day": "Ctrl+Y",
+  "show_earlier": "E"
 }
 ```
 
@@ -274,6 +291,8 @@ never rewritten by the app — edit it and reload via the right-click menu or re
   button hints always reflect the currently configured bindings.
 - `new_day` is the historical key name for the action now labelled "Reset Time"; it is kept as-is so
   `hotkeys.json` files written by earlier builds keep working without edits.
+- `show_earlier` toggles the Complete column's "today only" view. It is absent from `hotkeys.json` files
+  written by earlier builds, which simply keep the built-in default.
 
 ## Card Interactions
 
@@ -292,6 +311,7 @@ never rewritten by the app — edit it and reload via the right-click menu or re
 | File a report in your own words (opens browser) | Right-click empty space → Report with Prompt... | **Ctrl+Shift+R** |
 | Check for updates (self-updates) | Right-click empty space → Check for Updates | **Ctrl+U** |
 | Reset Time: fold every countup into its total and stop the stopwatch | Right-click empty space → Reset Time (push countups to totals), or click "Reset Time" at the bottom of In-Progress | **Ctrl+Y** |
+| Show the completed cards from before today (toggles the Complete column's "today only" view) | Click "Show earlier (N)" at the bottom of Complete | **E** |
 
 Keyboard actions target the card under the last known mouse position, or the card picked with the arrow keys when the cursor isn't over one; they no-op when neither applies. The focused card is outlined in black, and the red (blocked) and green (running) outlines take visual priority.
 
@@ -299,6 +319,15 @@ The **focus box** is a black 3px outline and follows the user: it lands on the c
 
 Every keyboard shortcut above is a **default** editable in `hotkeys.json` (see Data Format); the keys
 shown in the menus and on the "+ Add a card" and "Reset Time" buttons always reflect the current bindings.
+
+The **Complete** column shows only the cards completed **today**. A `Show earlier (N)` button at the bottom of
+the column — labelled with how many older completions it would reveal — reveals the rest for the rest of the
+session. This is view state only: it is kept in memory, so the board opens on today's completions after every
+launch, and every card stays in `board.json` either way (nothing is pruned, moved to a second file, or loaded
+selectively), which keeps the change display-only and costs no measurable memory. Todo and In-Progress are
+never filtered, so cards in flight are always visible. Older and undated cards are hidden rather than deleted,
+and re-opening a card clears its completion stamp, so a card completed at 23:50 and re-opened at 00:10 is not
+counted as today's until it is completed again.
 
 Stopwatches only count up in the **In-Progress** column: starting one elsewhere (Shift+click, double-click,
 **S**, or the card menu) says so and changes nothing, and a card dragged or keyed out of In-Progress has its
