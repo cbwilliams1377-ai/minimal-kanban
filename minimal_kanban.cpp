@@ -65,7 +65,7 @@ static const wchar_t* HELP_CLASS = L"MinimalKanbanHelp"; // Name of the F1 help 
 static const wchar_t* TITLES[3] = { L"Todo", L"In-Progress", L"Complete" };
 static const wchar_t* GITHUB_OWNER = L"cbwilliams1377-ai";
 static const wchar_t* GITHUB_REPO = L"minimal-kanban";
-static const wchar_t* APP_VERSION = L"0.1.16";
+static const wchar_t* APP_VERSION = L"0.1.17";
 // Names of the rebindable actions, used both as hotkeys.json keys and when
 // matching a pressed key back to its action. "new_day" keeps its original file
 // key even though the action is now called "Reset Time", so hotkeys.json files
@@ -1476,7 +1476,9 @@ static LRESULT CALLBACK ConfirmProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == IDOK) { g_confirm->accepted = true; DestroyWindow(hwnd); return 0; }
         if (LOWORD(wp) == IDCANCEL) { DestroyWindow(hwnd); return 0; }
         break;
-    case WM_CLOSE: DestroyWindow(hwnd); return 0; }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_confirm->done = true; return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -1692,7 +1694,6 @@ static void DeleteCard(HWND hwnd, int index) {
     std::wstring detail = Trim(g_cards[index].text);
     if (detail.size() > CONFIRM_TEXT_MAX) { detail.resize(CONFIRM_TEXT_MAX); detail += L"..."; }
     if (!AskConfirm(hwnd, L"Delete this card?", detail)) return;
-    g_dragIndex = -1; // Clear any active drag state to prevent freeze issues
     g_cards.erase(g_cards.begin() + index);
     FixSelectionAfterErase(hwnd, index);
     SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
