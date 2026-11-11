@@ -5,7 +5,7 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System deps: git, gh CLI, ffmpeg, mingw-w64 cross toolchain, node (for opencode-ai)
+# System deps: git, gh CLI, ffmpeg, mingw-w64 cross toolchain, node (for OpenCode)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git gnupg jq nodejs npm bash cron tzdata util-linux \
         ffmpeg \
@@ -19,8 +19,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
 
-# The BugBot agent itself (opencode). Installed globally so `opencode` is on PATH.
-RUN npm install -g opencode-ai
+# OpenCode V2 CLI (the legacy opencode-ai package is V1).
+RUN npm install -g @opencode/cli@2.2.7
 
 # Runner scripts
 WORKDIR /opt/bugbot

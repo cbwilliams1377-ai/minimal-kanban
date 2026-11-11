@@ -41,7 +41,7 @@ fi
 
 MODEL="$(cfg_get model)"
 [ -n "$MODEL" ] || { write_log "ERROR: model missing from config.json. Aborting."; exit 1; }
-FALLBACK_MODEL="${FALLBACK_MODEL:-opencode/nemotron-3.5-lightning-free}"
+FALLBACK_MODEL="${FALLBACK_MODEL:-$MODEL}"
 
 OC="$(cfg_get opencodePath)"
 [ -n "$OC" ] || OC=opencode
@@ -69,25 +69,27 @@ if [ -z "$oldest" ]; then
 fi
 
 write_log "Processing report: $oldest"
+cd "$WORKSPACE"
 
 run_with_fallback() {
     local primary="$1"
     local fallback="$2"
-    local run_failed=0
 
-    write_log "Running: $OC run --dir $WORKSPACE --model $primary --auto (prompt = BUGBOT.md)"
+    write_log "Running: $OC run --model $primary --auto (prompt = BUGBOT.md)"
     local prompt="$(cat "$PROMPT_FILE")"
-    "$OC" run --dir "$WORKSPACE" --model "$primary" --auto "$prompt" 2>&1 | tee -a "$LOG"
+    "$OC" run --model "$primary" --auto "$prompt" 2>&1 | tee -a "$LOG"
     statuses=("${PIPESTATUS[@]}")
     write_log "Primary model $primary exit code: ${statuses[0]}"
     if (( statuses[0] == 0 )); then
         exit "${statuses[1]}"
     fi
+    if [[ "$fallback" == "$primary" ]]; then
+        exit "${statuses[0]}"
+    fi
 
-    run_failed=1
     write_log "WARN: primary model $primary failed (exit ${statuses[0]}). Falling back to $fallback"
-    write_log "Running: $OC run --dir $WORKSPACE --model $fallback --auto (prompt = BUGBOT.md)"
-    "$OC" run --dir "$WORKSPACE" --model "$fallback" --auto "$prompt" 2>&1 | tee -a "$LOG"
+    write_log "Running: $OC run --model $fallback --auto (prompt = BUGBOT.md)"
+    "$OC" run --model "$fallback" --auto "$prompt" 2>&1 | tee -a "$LOG"
     fallback_statuses=("${PIPESTATUS[@]}")
     write_log "Fallback model $fallback exit code: ${fallback_statuses[0]}"
     exit "${fallback_statuses[0]}"

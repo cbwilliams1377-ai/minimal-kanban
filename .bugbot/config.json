@@ -1,6 +1,6 @@
 {
   "workspace": "C:\\Users\\CalebWilliams\\My Drive\\Workspaces\\My Kanban app - Workspace",
   "mode": "auto",
-  "model": "opencode/big-pickle",
+  "model": "lmstudio/qwen/qwen3.5-9b",
   "opencodePath": "opencode"
 }
