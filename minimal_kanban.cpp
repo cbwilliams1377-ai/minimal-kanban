@@ -1692,6 +1692,7 @@ static void DeleteCard(HWND hwnd, int index) {
     std::wstring detail = Trim(g_cards[index].text);
     if (detail.size() > CONFIRM_TEXT_MAX) { detail.resize(CONFIRM_TEXT_MAX); detail += L"..."; }
     if (!AskConfirm(hwnd, L"Delete this card?", detail)) return;
+    g_dragIndex = -1; // Clear any active drag state to prevent freeze issues
     g_cards.erase(g_cards.begin() + index);
     FixSelectionAfterErase(hwnd, index);
     SaveCards(); InvalidateRect(hwnd, nullptr, FALSE);
